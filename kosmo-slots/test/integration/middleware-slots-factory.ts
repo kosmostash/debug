@@ -467,14 +467,15 @@ export const createTests = async (backend: Backend) => {
       name: "an on-scoped override empties its slot on other methods",
       async runner({ expect }) {
         /**
-         * The slot is resolved before `on` is applied, so a cascading
-         * `{ slot: "validate:params", on: ["POST"] }` displaces both the global
-         * override and the built-in validator - and is then filtered out of a
-         * GET, leaving the slot with nothing in it.
+         * A slot has exactly one occupant, and `on` is that occupant's own
+         * declaration - never inherited from what it replaced. So a cascading
+         * `{ slot: "validate:params", on: ["POST"] }` takes the slot from both
+         * the global override and the built-in, and on a GET the slot is simply
+         * empty: claiming a slot means owning every method, and narrowing `on`
+         * narrows what the route validates.
          *
-         * The route declares a numeric id and the request sends "abc": a 200
-         * means nothing validated it. Pinning current behaviour, not endorsing
-         * it - scoping an override silently drops validation elsewhere.
+         * The route declares a numeric id and the request sends "abc", so a 200
+         * is the visible consequence - worth knowing before scoping a validator.
          * */
         const { status, trace } = await matrixTrace("scoped/probe/abc");
 
