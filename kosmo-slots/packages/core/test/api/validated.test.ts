@@ -16,7 +16,10 @@ const PARAMS = { id: 1, name: "kosmo" };
  * target. Every generated project sets `validation: true`, so this shape is
  * reachable only from a unit test.
  * */
-const validatedIn = async (validationSchemas: ValidationSchemas = {}) => {
+const validatedIn = async (
+  validationSchemas: ValidationSchemas = {},
+  validationEnabled = true,
+) => {
   let seen: Record<string, unknown> | undefined;
 
   const handler: HandlerDefinition<Middleware> = {
@@ -58,6 +61,7 @@ const validatedIn = async (validationSchemas: ValidationSchemas = {}) => {
       return { status: 200, contentType: null, body: async () => undefined };
     },
     globalMiddleware: [],
+    validationEnabled,
   });
 
   // koa-style compose - the shape every backend adapter ends up calling
@@ -70,6 +74,35 @@ const validatedIn = async (validationSchemas: ValidationSchemas = {}) => {
 
   return seen ?? {};
 };
+
+/** a schema object that is present but cannot validate - a codegen bug */
+const malformed = { check: () => true } as never;
+
+describe("validation disabled for the folder", () => {
+  test("params are still seeded", async () => {
+    expect(await validatedIn({}, false)).toHaveProperty("params", PARAMS);
+  });
+});
+
+describe("a malformed schema fails loudly", () => {
+  test("params", async () => {
+    await expect(validatedIn({ params: malformed })).rejects.toThrow(
+      /malformed params schema for GET - no validate\(\)/,
+    );
+  });
+
+  test("a per-method target", async () => {
+    await expect(
+      validatedIn({ query: { GET: malformed } } as never),
+    ).rejects.toThrow(/malformed query schema for GET - no validate\(\)/);
+  });
+
+  test("but an absent schema is not malformed", async () => {
+    // the two must stay distinguishable: `validation: false` has no schemas
+    // at all, and that is a configuration, not a bug
+    await expect(validatedIn({})).resolves.toHaveProperty("params", PARAMS);
+  });
+});
 
 describe("ctx.validated", () => {
   test("params are present even with no params schema", async () => {
