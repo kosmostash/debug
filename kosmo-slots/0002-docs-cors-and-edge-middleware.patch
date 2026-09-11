@@ -1,0 +1,139 @@
+diff --git a/docs/agents.md b/docs/agents.md
+index d268460..c187e7f 100644
+--- a/docs/agents.md
++++ b/docs/agents.md
+@@ -105,7 +105,9 @@ Shared across a route subtree -> a [cascading `use.ts`](/backend/cascading-middl
+ it auto-wraps the folder and its subfolders and exports a `UseT` that cascades context types downward.
+ One route only -> an inline `use` inside `defineRoute`.
+ Global -> the [`api/use.ts`](/backend/middleware).
+-Edge -> the [`api/app.ts`](/backend/edge-middleware).
++Before validation -> an [`edge:` prefixed slot](/backend/edge-middleware) on any of the above.
++Every request, matched route or not -> [`api/app.ts`](/backend/middleware#app-middleware) - the only
++layer that sees preflights, `405`s and unmatched URLs, so CORS belongs here.
+ 
+ Keep cascading middleware generic. It runs for sibling routes too, so a param like `id` may be `undefined` there.
+ 
+diff --git a/docs/backend/cascading-middleware.md b/docs/backend/cascading-middleware.md
+index be24280..de96e1f 100644
+--- a/docs/backend/cascading-middleware.md
++++ b/docs/backend/cascading-middleware.md
+@@ -239,14 +239,11 @@ Add middleware to `use.ts` and it will run on every route underneath:
+ :::tabs key:backend variant:code
+ == Hono
+ ```ts
+-import { cors } from "hono/cors";
+ import { rateLimiter } from "hono-rate-limiter";
+ 
+ import { use } from "_/api";
+ 
+ export default [
+-  use(cors({ origin: "https://example.com" })),
+-
+   use(
+     rateLimiter({
+       windowMs: 15 * 60 * 1000,
+@@ -262,8 +259,8 @@ export default [
+ import { use } from "_/api";
+ 
+ export default [
+-  use(async function cors(event, next) {
+-    event.res.headers.set("access-control-allow-origin", "https://example.com");
++  use(async function noStore(event, next) {
++    event.res.headers.set("cache-control", "no-store");
+     return next();
+   }),
+ ];
+@@ -271,7 +268,6 @@ export default [
+ 
+ == Koa
+ ```ts
+-import koaCors from "@koa/cors";
+ import ratelimit from "koa-ratelimit";
+ 
+ import { use } from "_/api";
+@@ -279,13 +275,17 @@ import { use } from "_/api";
+ const db = new Map();
+ 
+ export default [
+-  use(koaCors({ origin: "https://example.com" })),
+-
+   use(ratelimit({ driver: "memory", db, duration: 15 * 60 * 1000, max: 100 })),
+ ];
+ ```
+ :::
+ 
++::: warning Not CORS, though
++A `use.ts` is composed into each route's chain, so it only runs once a route has matched.
++A preflight `OPTIONS` is answered before that, and never reaches it.
++CORS belongs in `api/app.ts`, as [app&nbsp;middleware](/backend/middleware#app-middleware).
++:::
++
+ ### Authentication for a subtree
+ 
+ Gate a whole section of the API by dropping a `use.ts` into its folder.
+diff --git a/docs/backend/middleware.md b/docs/backend/middleware.md
+index c033675..07562f0 100644
+--- a/docs/backend/middleware.md
++++ b/docs/backend/middleware.md
+@@ -113,7 +113,10 @@ A preflight `OPTIONS`, or a `405` for a method the route doesn't implement,
+ is answered before any route chain runs - so global middleware never sees it:
+ Which makes this the wrong home for **CORS**: the preflight would never reach your middleware,
+ and the browser would reject the request before it ever sent the real one.
+-CORS - and anything else that must appear on *every* response - belongs to [edge&nbsp;middleware](/backend/edge-middleware).
++[Edge&nbsp;middleware](/backend/edge-middleware) is no better here - it runs first *inside* a matched
++route's chain, so an unmatched preflight never reaches it either.
++CORS - and anything else that must appear on *every* response - belongs to
++[app&nbsp;middleware](#app-middleware) in `api/app.ts`.
+ :::
+ 
+ ## Method-Specific Middleware
+@@ -195,7 +198,7 @@ the [`edge:`](/backend/edge-middleware) family is the one you are likely to reac
+ 
+ ### Promoting to the Route Edge
+ 
+-Any `use()` entry claiming an `edge:` prefixed slot in `api/use.rs`, in a cascading `use.ts`, or in the route itself -
++Any `use()` entry claiming an `edge:` prefixed slot in `api/use.ts`, in a cascading `use.ts`, or in the route itself -
+ is lifted out of its usual position and run first in the matched route's chain instead, ahead of validation.
+ That is [edge middleware](/backend/edge-middleware).
+ 
+diff --git a/docs/essentials/config.md b/docs/essentials/config.md
+index df99f34..3bfb298 100644
+--- a/docs/essentials/config.md
++++ b/docs/essentials/config.md
+@@ -23,7 +23,7 @@ my-app/
+ ```
+ 
+ There is no project-wide `kosmo.config.ts`, and no `vite.config.ts`:
+-each side of the folder carries its own [viteConfig](#frontend-vite-config).
++each side of the folder carries its own [viteConfig](#frontend-viteconfig).
+ 
+ ## The Shape
+ 
+@@ -223,7 +223,7 @@ A handful of Vite keys are **not** accepted, because KosmoJS derives them from t
+ 
+ A bare name, or the same object form the frontend takes.
+ The backend stacks have no Vite plugin, so the object carries only `name` today and the bare name is the usual form.
+-Vite settings for the API build go in [viteConfig](#backend-vite-config).
++Vite settings for the API build go in [viteConfig](#backend-viteconfig).
+ 
+ ### backend.base - required
+ 
+diff --git a/docs/faq.md b/docs/faq.md
+index 6b32d4a..0b466ac 100644
+--- a/docs/faq.md
++++ b/docs/faq.md
+@@ -603,10 +603,10 @@ anything narrower belongs in a subtree `use.ts` or the route's own `use`.
+ [Details&nbsp;›](/backend/middleware)
+ 
+ #### Where does CORS go?
+-Add it to [edge middleware](/backend/edge-middleware).
+-Global middleware wont work for CORS - a preflight `OPTIONS` is answered before any route chain runs,
+-so anything composed per route never sees it and the browser rejects the request.
+-[Details&nbsp;›](/backend/edge-middleware)
++`api/app.ts`, as [app middleware](/backend/middleware#app-middleware).
++Neither global nor edge middleware works for CORS - a preflight `OPTIONS` is answered before any
++route chain runs, so anything composed per route never sees it and the browser rejects the request.
++[Details&nbsp;›](/backend/middleware#app-middleware)
+ 
+ #### How do I return 401 instead of 400 when a token is bad?
+ Give the auth middleware an `edge:` slot - `edge:auth`, say - and it runs ahead of validation,
