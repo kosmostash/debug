@@ -50,11 +50,8 @@ const dialects: Record<
  *
  * `ctx.metaparser.query()` is cached per request and returns the same object
  * every time, so appending to it gives a request-scoped trace with no shared
- * state between requests - and proves the metaparser is usable at the edge.
- *
- * NOTE: parsing a target here also makes `ctx.validated[target]` non-empty -
- * the two share one per-request cache - so probe an untouched target when
- * asserting that validation has not run.
+ * state between requests - and proves the metaparser is usable at the edge,
+ * where `ctx.validated.*` is still empty.
  * */
 const record = (ctx: string, label: string) => {
   return `const q = ${ctx}.metaparser.query();
@@ -91,7 +88,7 @@ export const createTests = async (backend: Backend) => {
         use(async (${ctx}, next) => {
           ${record(ctx, "edge:auth")}
           // validation has not run yet - this is what makes 401-before-400 work
-          q.validatedAtEdge = String(${ctx}.validated.headers);
+          q.validatedAtEdge = String(${ctx}.validated.query);
           if (q.token !== "ok" && q.authenticate === "yes") {
             ${deny(401, "Authentication required")}
           }
@@ -276,7 +273,7 @@ export const createTests = async (backend: Backend) => {
     },
 
     {
-      name: "an unparsed ctx.validated target is empty at the edge",
+      name: "ctx.validated is empty at the edge even for a parsed target",
       async runner({ expect }) {
         const { validatedAtEdge } = await traceOf("chain");
         expect(validatedAtEdge).toEqual("undefined");
