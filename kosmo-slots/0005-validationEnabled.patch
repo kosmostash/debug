@@ -1,0 +1,251 @@
+diff --git a/packages/core/src/api/routes.ts b/packages/core/src/api/routes.ts
+index 33499db..2d2cb2b 100644
+--- a/packages/core/src/api/routes.ts
++++ b/packages/core/src/api/routes.ts
+@@ -1,10 +1,12 @@
+ import { ValidationError } from "../errors";
+ import {
+   type RequestBodyTarget,
++  RequestBodyTargets,
+   type RequestMetadataParser,
+   type RequestValidationTarget,
+   RequestValidationTargets,
+   type ValidationErrorEntry,
++  type ValidationSchema,
+ } from "../types";
+ import { debugRouteEntry } from "./debug";
+ import {
+@@ -26,6 +28,7 @@ export const createRoutes = <MiddlewareT, MiddlewareR>(
+     createBodyparsers,
+     responseResolver,
+     globalMiddleware,
++    validationEnabled = true,
+   }: {
+     productionBuild: boolean;
+     createMetaparsers: (
+@@ -54,6 +57,7 @@ export const createRoutes = <MiddlewareT, MiddlewareR>(
+     };
+     // Global middleware applied to every route (e.g., logging)
+     globalMiddleware: Array<MiddlewareDefinition<MiddlewareT>>;
++    validationEnabled?: boolean;
+   },
+ ): Array<Route<MiddlewareR>> => {
+   // NOTE:: prioritized middleware must run in this exact order!
+@@ -70,6 +74,19 @@ export const createRoutes = <MiddlewareT, MiddlewareR>(
+     "validate:response",
+   ];
+ 
++  /**
++   * Whether a slot name is one this list already positions.
++   *
++   * NOTE: a plain `includes` cannot answer this - the list mixes literal names
++   * with patterns, and `edge:auth` is a member by virtue of matching `/^edge:.+/`,
++   * not by being in the array.
++   * */
++  const isPrioritizedSlot = (slot: string): boolean => {
++    return prioritizedSlots.some((entry) => {
++      return typeof entry === "string" ? entry === slot : entry.test(slot);
++    });
++  };
++
+   const stack: Array<Route<MiddlewareR>> = [];
+ 
+   // Iterate over each route definition
+@@ -149,7 +166,7 @@ export const createRoutes = <MiddlewareT, MiddlewareR>(
+                 (map, target) => {
+                   return Object.defineProperty(map, target, {
+                     get() {
+-                      return ctx[StateKey].get(target);
++                      return ctx[StateKey].get(`validated:${target}`);
+                     },
+                     enumerable: true,
+                   });
+@@ -202,17 +219,44 @@ export const createRoutes = <MiddlewareT, MiddlewareR>(
+           next: Function,
+         ) => {
+           const method = ctx.metaparser.method();
+-          const schema =
+-            target === "params"
+-              ? { ...validationSchemas[target] }
+-              : {
+-                  ...validationSchemas[target]?.[
+-                    method === "HEAD" ? "GET" : method
+-                  ],
+-                };
+-          if (schema.validate && schema.runtimeValidation !== false) {
+-            schema.validate(await ctx[key][target]());
++
++          const validate = (schema: ValidationSchema, value: unknown) => {
++            if (typeof schema?.validate !== "function") {
++              throw new Error(
++                `${name}: malformed ${target} schema for ${method} - no validate()`,
++              );
++            }
++            schema.validate(value);
++          };
++
++          if (target === "params") {
++            const value = ctx[key][target]();
++            /**
++             * Every route gets a params schema, static ones included, so a
++             * missing one here is a codegen bug rather than a configuration -
++             * validation being off for the folder is handled upstream, by not
++             * composing these validators at all.
++             * */
++            validate(validationSchemas[target] as never, value);
++            ctx[StateKey].set(`validated:${target}`, value);
++          } else {
++            const schema =
++              method === "HEAD"
++                ? validationSchemas[target]?.GET
++                : validationSchemas[target]?.[method];
++
++            if (schema && schema.runtimeValidation !== false) {
++              // keep this inside branch to load only when a schema defined.
++              const value = RequestBodyTargets[target as never]
++                ? await ctx[key][target]()
++                : ctx[key][target]();
++
++              validate(schema, value);
++
++              ctx[StateKey].set(`validated:${target}`, value);
++            }
+           }
++
+           return next();
+         },
+         {
+@@ -421,31 +465,71 @@ export const createRoutes = <MiddlewareT, MiddlewareR>(
+       (e) => e.kind === "middleware",
+     );
+ 
+-    // NOTE: should be built in exactly this order
+-    const middlewareStack: Array<MiddlewareDefinition<MiddlewareT>> = [
+-      // per-route defined middleware - highest priority
+-      ...routeMiddleware,
+-      // global middleware defined in api/use.ts
++    /**
++     * Every user-authored declaration of a slot, outermost first:
++     * `api/use.ts`, then the cascading `use.ts` files, then the route itself.
++     * */
++    const slotDeclarations: Array<MiddlewareDefinition<MiddlewareT>> = [
+       ...globalMiddleware,
+-      // built-in middleware
++      ...routeMiddleware,
++    ];
++
++    // built-in middleware, the fallback owner of the slots it ships with
++    const builtinMiddleware: Array<MiddlewareDefinition<MiddlewareT>> = [
+       ...edgeMiddleware,
+-      ...validationMiddleware,
++      ...(validationEnabled ? validationMiddleware : []),
+     ];
+ 
++    /**
++     * The middleware that owns a slot.
++     *
++     * A slot is a named position with exactly one occupant: the innermost
++     * declaration wins, so a route's `use` replaces a cascading `use.ts` entry,
++     * which in turn replaces the global one - and any of them replaces the built-in.
++     * Position is decided separately, by the outermost declaration, so an override
++     * substitutes an implementation without moving the slot.
++     * */
++    const resolveSlot = (
++      slot: string,
++    ): MiddlewareDefinition<MiddlewareT> | undefined => {
++      return (
++        slotDeclarations.findLast((e) => e.options?.slot === slot) ||
++        builtinMiddleware.find((e) => e.options?.slot === slot)
++      );
++    };
++
+     const routeStack: Array<
+       MiddlewareDefinition<MiddlewareT> | HandlerDefinition<MiddlewareT>
+     > = [
+       ...prioritizedSlots.flatMap((slot) => {
+-        const middleware = middlewareStack.find(({ options }) => {
+-          return options?.slot
+-            ? typeof slot === "string"
+-              ? options.slot === slot
+-              : slot.test(String(options.slot))
+-            : false;
++        if (typeof slot === "string") {
++          const middleware = resolveSlot(slot);
++          return middleware //
++            ? [middleware]
++            : [];
++        }
++
++        /**
++         * A pattern entry (`edge:*`) is a family of slots, not a single position:
++         * each distinct name in it gets its own place in the chain, in the order
++         * the names were first declared, so `edge:ratelimit` and `edge:auth`
++         * both run at the edge and either can be overridden on its own.
++         * */
++        const slotNames: Array<string> = [];
++
++        for (const { options } of slotDeclarations) {
++          const name = options?.slot;
++          if (name && slot.test(name) && !slotNames.includes(name)) {
++            slotNames.push(name);
++          }
++        }
++
++        return slotNames.flatMap((name) => {
++          const middleware = resolveSlot(name);
++          return middleware //
++            ? [middleware]
++            : [];
+         });
+-        return middleware //
+-          ? [middleware]
+-          : [];
+       }),
+ 
+       ...globalMiddleware.flatMap((entry) => {
+@@ -453,14 +537,15 @@ export const createRoutes = <MiddlewareT, MiddlewareR>(
+           // no slot, including regardless
+           return [entry];
+         }
+-        if (prioritizedSlots.includes(entry.options.slot)) {
++        if (isPrioritizedSlot(entry.options.slot)) {
+           // already picked when inserted prioritized middleware, excluding
+           return [];
+         }
+-        const override = routeMiddleware.find(
+-          (e) => e.options?.slot === entry.options?.slot,
+-        );
+-        return [override || entry];
++        // this declaration holds the position, an inner one may own the slot
++        const middleware = resolveSlot(entry.options.slot);
++        return middleware //
++          ? [middleware]
++          : [];
+       }),
+ 
+       ...definitionItems.flatMap((entry) => {
+@@ -470,7 +555,7 @@ export const createRoutes = <MiddlewareT, MiddlewareR>(
+             : undefined;
+ 
+         if (slot) {
+-          if (prioritizedSlots.includes(slot)) {
++          if (isPrioritizedSlot(slot)) {
+             // already picked when inserted prioritized middleware, excluding
+             return [];
+           }
+@@ -478,6 +563,15 @@ export const createRoutes = <MiddlewareT, MiddlewareR>(
+             // already picked when inserted global middleware, excluding
+             return [];
+           }
++          if (routeMiddleware.find((e) => e.options?.slot === slot) !== entry) {
++            // an outer declaration already holds this slot's position, excluding
++            return [];
++          }
++          // this declaration holds the position, an inner one may own the slot
++          const middleware = resolveSlot(slot);
++          return middleware //
++            ? [middleware]
++            : [];
+         }
+ 
+         return [entry];

@@ -7,17 +7,24 @@ import type { ValidationSchemas } from "../../src/types";
 type Middleware = (ctx: never, next: Function) => unknown;
 
 const PARAMS = { id: 1, name: "kosmo" };
+const QUERY = { page: 2 };
+
+/** a schema that passes everything, standing in for a generated one */
+const permissive = { validate: () => {} } as never;
+
+/** present but unable to validate - a codegen bug, never a configuration */
+const malformed = { check: () => true } as never;
 
 /**
- * Run a route's composed chain against a bare context and hand back whatever
- * the handler saw on `ctx.validated`.
+ * Run a route's composed chain and hand back what the handler saw on
+ * `ctx.validated`.
  *
- * `validationSchemas: {}` is the `validation: false` folder - no schema for any
- * target. Every generated project sets `validation: true`, so this shape is
- * reachable only from a unit test.
+ * Mirrors the real shapes only: a folder either has validation on, in which
+ * case every route carries a params schema (static routes included), or has it
+ * off, in which case the validators are not composed at all.
  * */
 const validatedIn = async (
-  validationSchemas: ValidationSchemas = {},
+  validationSchemas: ValidationSchemas,
   validationEnabled = true,
 ) => {
   let seen: Record<string, unknown> | undefined;
@@ -52,7 +59,7 @@ const validatedIn = async (
         method: () => "GET",
         pathname: () => "/users/1/kosmo",
         params: () => PARAMS,
-        query: () => ({ page: 2 }),
+        query: () => QUERY,
         headers: () => ({}),
         cookies: () => ({}),
       }) as never,
@@ -75,62 +82,74 @@ const validatedIn = async (
   return seen ?? {};
 };
 
-/** a schema object that is present but cannot validate - a codegen bug */
-const malformed = { check: () => true } as never;
+describe("validation enabled", () => {
+  test("a validated target is filled", async () => {
+    const validated = await validatedIn({
+      params: permissive,
+      query: { GET: permissive } as never,
+    });
 
-describe("validation disabled for the folder", () => {
-  test("params are still seeded", async () => {
-    expect(await validatedIn({}, false)).toHaveProperty("params", PARAMS);
+    expect(validated.params).toEqual(PARAMS);
+    expect(validated.query).toEqual(QUERY);
+  });
+
+  test("params go through the schema", async () => {
+    const checked: Array<unknown> = [];
+
+    await validatedIn({
+      params: { validate: (data: unknown) => checked.push(data) } as never,
+    });
+
+    expect(checked).toEqual([PARAMS]);
+  });
+
+  test("a target with no schema for this method stays empty", async () => {
+    // a route may declare `json` on POST only - a GET having no json schema is
+    // ordinary, unlike params, which every route carries
+    const validated = await validatedIn({ params: permissive });
+
+    expect(validated.query).toBeUndefined();
+    expect(validated.json).toBeUndefined();
   });
 });
 
-describe("a malformed schema fails loudly", () => {
-  test("params", async () => {
+describe("a schema that cannot validate fails loudly", () => {
+  test("params missing entirely", async () => {
+    // every route gets a params schema, static ones included, so its absence
+    // is a codegen bug - not a folder that opted out
+    await expect(validatedIn({})).rejects.toThrow(
+      /malformed params schema for GET - no validate\(\)/,
+    );
+  });
+
+  test("params present but without validate()", async () => {
     await expect(validatedIn({ params: malformed })).rejects.toThrow(
       /malformed params schema for GET - no validate\(\)/,
     );
   });
 
-  test("a per-method target", async () => {
+  test("a per-method target without validate()", async () => {
     await expect(
-      validatedIn({ query: { GET: malformed } } as never),
+      validatedIn({
+        params: permissive,
+        query: { GET: malformed },
+      } as never),
     ).rejects.toThrow(/malformed query schema for GET - no validate\(\)/);
-  });
-
-  test("but an absent schema is not malformed", async () => {
-    // the two must stay distinguishable: `validation: false` has no schemas
-    // at all, and that is a configuration, not a bug
-    await expect(validatedIn({})).resolves.toHaveProperty("params", PARAMS);
   });
 });
 
-describe("ctx.validated", () => {
-  test("params are present even with no params schema", async () => {
-    // ExtendContext types `validated` as `& { params: ParamsT }` - always
-    // present, never optional - so the runtime has to hold up its end
-    expect(await validatedIn({})).toHaveProperty("params", PARAMS);
+describe("validation disabled for the folder", () => {
+  test("every target is empty, params included", async () => {
+    // the validators are not composed at all, so nothing has passed a schema.
+    // Reading the request goes through ctx.metaparser, which is unaffected.
+    const validated = await validatedIn({}, false);
+
+    for (const target of ["params", "query", "headers", "cookies", "json"]) {
+      expect(validated[target], target).toBeUndefined();
+    }
   });
 
-  test("params run through the schema when there is one", async () => {
-    const checked: Array<unknown> = [];
-
-    const validated = await validatedIn({
-      params: {
-        validate: (data: unknown) => {
-          checked.push(data);
-        },
-      } as never,
-    });
-
-    expect(checked).toEqual([PARAMS]);
-    expect(validated).toHaveProperty("params", PARAMS);
-  });
-
-  test("a target with no schema stays empty", async () => {
-    // unlike params, the other targets are filled by validation and nothing
-    // else - parsing one through the metaparser must not leak into `validated`.
-    // Every target is an enumerable getter, so the key is always there and it
-    // is the value that has to be undefined.
-    expect((await validatedIn({})).query).toBeUndefined();
+  test("a missing params schema is not an error here", async () => {
+    await expect(validatedIn({}, false)).resolves.toBeTruthy();
   });
 });
