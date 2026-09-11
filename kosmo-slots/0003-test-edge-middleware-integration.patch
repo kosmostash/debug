@@ -518,10 +518,10 @@ index 29e3057..f65e33f 100644
  });
 diff --git a/test/integration/middleware-slots-factory.ts b/test/integration/middleware-slots-factory.ts
 new file mode 100644
-index 0000000..f57c2ed
+index 0000000..bf0ea60
 --- /dev/null
 +++ b/test/integration/middleware-slots-factory.ts
-@@ -0,0 +1,319 @@
+@@ -0,0 +1,516 @@
 +import { writeFile } from "node:fs/promises";
 +
 +import type { TestFunction } from "vitest";
@@ -577,6 +577,33 @@ index 0000000..f57c2ed
 + * state between requests - and proves the metaparser is usable at the edge,
 + * where `ctx.validated.*` is still empty.
 + * */
++/**
++ * Every named validation slot, in the order createRoutes positions them.
++ * A trace of these names is the whole override matrix in one assertion.
++ * */
++const VALIDATION_SLOTS = [
++  "validate:params",
++  "validate:query",
++  "validate:headers",
++  "validate:cookies",
++  "validate:json",
++  "validate:form",
++  "validate:raw",
++  "validate:response",
++] as const;
++
++type Level = "global" | "cascading" | "route";
++
++/** what a validator override records: "global:validate:params" */
++const slotLabel = (level: Level, slot: string) => `${level}:${slot}`;
++
++const OVERRIDE = /^(global|cascading|route):validate:/;
++
++const validatorsIn = (trace: Array<string>) =>
++  trace.filter((e) => OVERRIDE.test(e));
++const withoutValidators = (trace: Array<string>) =>
++  trace.filter((e) => !OVERRIDE.test(e));
++
 +const record = (ctx: string, label: string) => {
 +  return `const q = ${ctx}.metaparser.query();
 +      q.trace = [...(q.trace ?? []), "${label}"];`;
@@ -619,6 +646,7 @@ index 0000000..f57c2ed
 +          return next();
 +        }, { slot: "edge:auth" }),
 +        ${use("global")},
++        ${VALIDATION_SLOTS.map((slot) => use(slotLabel("global", slot), slot)).join(",\n        ")},
 +      ];
 +    `,
 +  );
@@ -637,6 +665,37 @@ index 0000000..f57c2ed
 +    `;
 +    },
 +  );
++
++  // re-claims every validation slot for its subtree
++  await project.createApiRoutes(
++    [{ name: "overridden", file: "use" }],
++    async () => {
++      return () => `
++        import { use } from "_/api";
++        export type UseT = {};
++        export default [
++          ${VALIDATION_SLOTS.map((slot) => use(slotLabel("cascading", slot), slot)).join(",\n          ")},
++        ];
++      `;
++    },
++  );
++
++  /**
++   * An override carrying `on` - the slot is resolved before `on` is applied,
++   * so the question is what a method outside that list ends up with.
++   * */
++  await project.createApiRoutes([{ name: "scoped", file: "use" }], async () => {
++    return () => `
++      import { use } from "_/api";
++      export type UseT = {};
++      export default [
++        use(async (${ctx}, next) => {
++          ${record(ctx, slotLabel("cascading", "validate:params"))}
++          return next();
++        }, { slot: "validate:params", on: ["POST"] }),
++      ];
++    `;
++  });
 +
 +  const handler = `GET(async (${ctx}) => {
 +    const q = ${ctx}.metaparser.query();
@@ -681,6 +740,41 @@ index 0000000..f57c2ed
 +        import { defineRoute } from "_/api";
 +        export default defineRoute<"${name}">(({ GET, use }) => [
 +          ${body},
++        ]);
++      `;
++    },
++  );
++
++  /**
++   * Each matrix route declares a numeric `id`, and every request below sends a
++   * non-numeric one. A surviving built-in `validate:params` would answer 400,
++   * so a 200 is proof the override displaced it rather than merely preceding it.
++   * */
++  const matrix: Array<[name: string, overrides: Array<string>]> = [
++    // nothing local - the global use.ts holds every slot
++    ["at-global/[id]", []],
++    // under the cascading use.ts, which re-claims them from the global one
++    ["overridden/at-cascading/[id]", []],
++    // and the route takes them from the cascading one
++    [
++      "overridden/at-route/[id]",
++      VALIDATION_SLOTS.map((slot) => use(slotLabel("route", slot), slot)),
++    ],
++    // the `on`-scoped cascading override, requested on a method it excludes
++    ["scoped/probe/[id]", []],
++  ];
++
++  await project.createApiRoutes(
++    matrix.map(([name]) => ({ name })),
++    async ({ name }) => {
++      const [, overrides] = matrix.find(([route]) => route === name) as [
++        string,
++        Array<string>,
++      ];
++      return () => `
++        import { defineRoute } from "_/api";
++        export default defineRoute<"${name}", [number]>(({ GET, use }) => [
++          ${[...overrides, handler].join(",\n          ")},
 +        ]);
 +      `;
 +    },
@@ -734,11 +828,25 @@ index 0000000..f57c2ed
 +    return json as { trace: Array<string>; validatedAtEdge: string };
 +  };
 +
++  /** the validation-slot labels a matrix route recorded, plus its status */
++  const matrixTrace = async (path: string) => {
++    const { status, json, body } = await request(path);
++    if (status !== 200) {
++      return { status, trace: [] as Array<string>, body };
++    }
++    return {
++      status,
++      body,
++      trace: validatorsIn((json as { trace: Array<string> }).trace),
++    };
++  };
++
 +  const tests: Array<{ name: string; runner: TestFunction }> = [
 +    {
 +      name: "edge slots run first, in declaration order, exactly once",
 +      async runner({ expect }) {
-+        const { trace } = await traceOf("chain");
++        const { trace: raw } = await traceOf("chain");
++        const trace = withoutValidators(raw);
 +        expect(trace).toEqual([
 +          "edge:ratelimit",
 +          "edge:auth",
@@ -751,7 +859,8 @@ index 0000000..f57c2ed
 +    {
 +      name: "a route override substitutes its own edge slot only",
 +      async runner({ expect }) {
-+        const { trace } = await traceOf("chain/route-edge");
++        const { trace: raw } = await traceOf("chain/route-edge");
++        const trace = withoutValidators(raw);
 +        // edge:ratelimit keeps its edge position; edge:auth is replaced in place
 +        expect(trace).toEqual([
 +          "edge:ratelimit",
@@ -766,7 +875,8 @@ index 0000000..f57c2ed
 +    {
 +      name: "a cascading use.ts substitutes an edge slot for its subtree",
 +      async runner({ expect }) {
-+        const { trace } = await traceOf("guarded/subtree");
++        const { trace: raw } = await traceOf("guarded/subtree");
++        const trace = withoutValidators(raw);
 +        expect(trace).toEqual([
 +          "edge:ratelimit",
 +          "subtree:auth",
@@ -778,14 +888,15 @@ index 0000000..f57c2ed
 +
 +        // a sibling outside the subtree still gets the global one
 +        const sibling = await traceOf("chain");
-+        expect(sibling.trace).toContain("edge:auth");
++        expect(withoutValidators(sibling.trace)).toContain("edge:auth");
 +      },
 +    },
 +
 +    {
 +      name: "a route-only edge slot runs at the edge with nothing to replace",
 +      async runner({ expect }) {
-+        const { trace } = await traceOf("audited");
++        const { trace: raw } = await traceOf("audited");
++        const trace = withoutValidators(raw);
 +        expect(trace).toEqual([
 +          "edge:ratelimit",
 +          "edge:auth",
@@ -823,12 +934,98 @@ index 0000000..f57c2ed
 +    },
 +
 +    {
++      name: "every validation slot is held by the global use.ts by default",
++      async runner({ expect }) {
++        const { trace, status } = await matrixTrace("at-global/abc");
++
++        expect(trace).toEqual(
++          VALIDATION_SLOTS.map((slot) => slotLabel("global", slot)),
++        );
++        // a surviving built-in validator would have rejected the non-numeric id
++        expect(status).toEqual(200);
++      },
++    },
++
++    {
++      name: "a cascading use.ts takes every slot from the global one",
++      async runner({ expect }) {
++        const { trace, status } = await matrixTrace(
++          "overridden/at-cascading/abc",
++        );
++
++        expect(trace).toEqual(
++          VALIDATION_SLOTS.map((slot) => slotLabel("cascading", slot)),
++        );
++        expect(trace.some((e) => e.startsWith("global:"))).toBe(false);
++        expect(status).toEqual(200);
++      },
++    },
++
++    {
++      name: "a route takes every slot from the cascading and global ones",
++      async runner({ expect }) {
++        const { trace, status } = await matrixTrace("overridden/at-route/abc");
++
++        expect(trace).toEqual(
++          VALIDATION_SLOTS.map((slot) => slotLabel("route", slot)),
++        );
++        expect(trace.some((e) => /^(global|cascading):/.test(e))).toBe(false);
++        expect(status).toEqual(200);
++      },
++    },
++
++    {
++      name: "each level claims a slot exactly once",
++      async runner({ expect }) {
++        for (const path of [
++          "at-global/abc",
++          "overridden/at-cascading/abc",
++          "overridden/at-route/abc",
++        ]) {
++          const { trace } = await matrixTrace(path);
++          expect(new Set(trace).size, path).toEqual(VALIDATION_SLOTS.length);
++        }
++      },
++    },
++    {
++      name: "an on-scoped override empties its slot on other methods",
++      async runner({ expect }) {
++        /**
++         * The slot is resolved before `on` is applied, so a cascading
++         * `{ slot: "validate:params", on: ["POST"] }` displaces both the global
++         * override and the built-in validator - and is then filtered out of a
++         * GET, leaving the slot with nothing in it.
++         *
++         * The route declares a numeric id and the request sends "abc": a 200
++         * means nothing validated it. Pinning current behaviour, not endorsing
++         * it - scoping an override silently drops validation elsewhere.
++         * */
++        const { status, trace } = await matrixTrace("scoped/probe/abc");
++
++        // nothing holds validate:params - not the cascading override that
++        // claimed it, not the global one it displaced, not the built-in
++        expect(trace.filter((e) => e.endsWith(":validate:params"))).toEqual([]);
++
++        // the slots it did not claim are untouched
++        expect(trace).toEqual(
++          VALIDATION_SLOTS.filter((slot) => slot !== "validate:params").map(
++            (slot) => slotLabel("global", slot),
++          ),
++        );
++
++        // and the non-numeric id reached the handler unchecked
++        expect(status).toEqual(200);
++      },
++    },
++
++    {
 +      name: "an edge slot that passes leaves the chain intact",
 +      async runner({ expect }) {
-+        const { trace } = await traceOf("chain", {
++        const { trace: raw } = await traceOf("chain", {
 +          authenticate: "yes",
 +          token: "ok",
 +        });
++        const trace = withoutValidators(raw);
 +        expect(trace).toEqual([
 +          "edge:ratelimit",
 +          "edge:auth",
