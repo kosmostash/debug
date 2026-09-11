@@ -9,55 +9,51 @@ type Middleware = (ctx: never, next: Function) => unknown;
 const PARAMS = { id: 1, name: "kosmo" };
 const QUERY = { page: 2 };
 
+const TARGETS = ["params", "query", "headers", "cookies", "json"] as const;
+
 /** a schema that passes everything, standing in for a generated one */
 const permissive = { validate: () => {} } as never;
 
 /** present but unable to validate - a codegen bug, never a configuration */
 const malformed = { check: () => true } as never;
 
-/**
- * Run a route's composed chain and hand back what the handler saw on
- * `ctx.validated`.
- *
- * Mirrors the real shapes only: a folder either has validation on, in which
- * case every route carries a params schema (static routes included), or has it
- * off, in which case the validators are not composed at all.
- * */
-const validatedIn = async (
-  validationSchemas: ValidationSchemas,
-  validationEnabled = true,
-) => {
-  let seen: Record<string, unknown> | undefined;
+type Seen = Record<string, unknown>;
 
+const routeSource = (
+  name: string,
+  validationSchemas: ValidationSchemas | undefined,
+  onHandled: (validated: Seen) => void,
+): RouteSource<Middleware> => {
   const handler: HandlerDefinition<Middleware> = {
     kind: "handler",
     method: "GET",
     middleware: [
-      ((ctx: { validated: Record<string, unknown> }) => {
-        seen = { ...ctx.validated };
-      }) as never,
+      ((ctx: { validated: Seen }) => onHandled({ ...ctx.validated })) as never,
     ],
   };
 
-  const routeSource: RouteSource<Middleware> = {
-    name: "users/[id]/[name]",
-    path: "/users/:id/:name",
-    pathPattern: "/users/:id/:name",
-    file: "users/[id]/[name]/index.ts",
+  return {
+    name,
+    path: `/${name}/:id/:name`,
+    pathPattern: `/${name}/:id/:name`,
+    file: `${name}/[id]/[name]/index.ts`,
     params: ["id", "name"],
     numericProperties: { params: ["id"], query: {} },
     booleanProperties: { query: {} },
     cascadingMiddleware: [],
     definitionItems: [handler],
-    validationSchemas,
+    // omitted entirely when the route is not validated
+    ...(validationSchemas ? { validationSchemas } : {}),
   };
+};
 
-  const [route] = createRoutes<Middleware, Middleware>([routeSource], {
+const build = (sources: Array<RouteSource<Middleware>>) => {
+  return createRoutes<Middleware, Middleware>(sources, {
     productionBuild: false,
     createMetaparsers: () =>
       ({
         method: () => "GET",
-        pathname: () => "/users/1/kosmo",
+        pathname: () => "/r/1/kosmo",
         params: () => PARAMS,
         query: () => QUERY,
         headers: () => ({}),
@@ -68,22 +64,33 @@ const validatedIn = async (
       return { status: 200, contentType: null, body: async () => undefined };
     },
     globalMiddleware: [],
-    validationEnabled,
   });
+};
 
-  // koa-style compose - the shape every backend adapter ends up calling
+// koa-style compose - the shape every backend adapter ends up calling
+const run = async (route: { middleware: Array<unknown> }) => {
   const ctx = {} as never;
   const dispatch = async (i: number): Promise<unknown> => {
     const fn = route.middleware[i] as Middleware | undefined;
     return fn ? fn(ctx, () => dispatch(i + 1)) : undefined;
   };
   await dispatch(0);
-
-  return seen ?? {};
 };
 
-describe("validation enabled", () => {
-  test("a validated target is filled", async () => {
+/** Run one route and hand back what its handler saw on `ctx.validated`. */
+const validatedIn = async (validationSchemas?: ValidationSchemas) => {
+  let seen: Seen = {};
+  const [route] = build([
+    routeSource("r", validationSchemas, (v) => {
+      seen = v;
+    }),
+  ]);
+  await run(route);
+  return seen;
+};
+
+describe("a route carrying schemas", () => {
+  test("fills the targets it declares", async () => {
     const validated = await validatedIn({
       params: permissive,
       query: { GET: permissive } as never,
@@ -93,7 +100,7 @@ describe("validation enabled", () => {
     expect(validated.query).toEqual(QUERY);
   });
 
-  test("params go through the schema", async () => {
+  test("runs params through the schema", async () => {
     const checked: Array<unknown> = [];
 
     await validatedIn({
@@ -103,9 +110,9 @@ describe("validation enabled", () => {
     expect(checked).toEqual([PARAMS]);
   });
 
-  test("a target with no schema for this method stays empty", async () => {
+  test("leaves a target with no schema for this method empty", async () => {
     // a route may declare `json` on POST only - a GET having no json schema is
-    // ordinary, unlike params, which every route carries
+    // ordinary, unlike params, which every validated route carries
     const validated = await validatedIn({ params: permissive });
 
     expect(validated.query).toBeUndefined();
@@ -114,12 +121,12 @@ describe("validation enabled", () => {
 });
 
 describe("a schema that cannot validate fails loudly", () => {
-  test("params missing entirely", async () => {
-    // every route gets a params schema, static ones included, so its absence
-    // is a codegen bug - not a folder that opted out
-    await expect(validatedIn({})).rejects.toThrow(
-      /malformed params schema for GET - no validate\(\)/,
-    );
+  test("params missing from an otherwise validated route", async () => {
+    // schemas were emitted for this route, so params must be among them -
+    // its absence is a codegen bug, not a route that opted out
+    await expect(
+      validatedIn({ query: { GET: permissive } } as never),
+    ).rejects.toThrow(/malformed params schema for GET - no validate\(\)/);
   });
 
   test("params present but without validate()", async () => {
@@ -130,26 +137,65 @@ describe("a schema that cannot validate fails loudly", () => {
 
   test("a per-method target without validate()", async () => {
     await expect(
-      validatedIn({
-        params: permissive,
-        query: { GET: malformed },
-      } as never),
+      validatedIn({ params: permissive, query: { GET: malformed } } as never),
     ).rejects.toThrow(/malformed query schema for GET - no validate\(\)/);
   });
 });
 
-describe("validation disabled for the folder", () => {
-  test("every target is empty, params included", async () => {
-    // the validators are not composed at all, so nothing has passed a schema.
-    // Reading the request goes through ctx.metaparser, which is unaffected.
-    const validated = await validatedIn({}, false);
+describe("a route carrying no schemas", () => {
+  test("validates nothing - every target stays empty, params included", async () => {
+    const validated = await validatedIn(undefined);
 
-    for (const target of ["params", "query", "headers", "cookies", "json"]) {
+    for (const target of TARGETS) {
       expect(validated[target], target).toBeUndefined();
     }
   });
 
-  test("a missing params schema is not an error here", async () => {
-    await expect(validatedIn({}, false)).resolves.toBeTruthy();
+  test("an empty schema map reads the same as none", async () => {
+    const validated = await validatedIn({});
+
+    for (const target of TARGETS) {
+      expect(validated[target], target).toBeUndefined();
+    }
+  });
+
+  test("composes no validators at all", async () => {
+    const [validated] = build([routeSource("a", { params: permissive }, () => {})]);
+    const [plain] = build([routeSource("b", undefined, () => {})]);
+
+    // the unvalidated route is shorter by exactly the validator set
+    expect(plain.middleware.length).toBeLessThan(validated.middleware.length);
+  });
+});
+
+describe("validation is per route", () => {
+  test("an unvalidated route does not disarm a validated sibling", async () => {
+    const seen: Record<string, Seen> = {};
+
+    const routes = build([
+      routeSource("validated", { params: permissive }, (v) => {
+        seen.validated = v;
+      }),
+      routeSource("plain", undefined, (v) => {
+        seen.plain = v;
+      }),
+    ]);
+
+    for (const route of routes) {
+      await run(route);
+    }
+
+    expect(seen.validated.params).toEqual(PARAMS);
+    expect(seen.plain.params).toBeUndefined();
+  });
+
+  test("a malformed schema on one route does not reach another", async () => {
+    const [, plain] = build([
+      routeSource("broken", { params: malformed }, () => {}),
+      routeSource("plain", undefined, () => {}),
+    ]);
+
+    // the broken route throws when it runs; this one is untouched by it
+    await expect(run(plain)).resolves.toBeUndefined();
   });
 });

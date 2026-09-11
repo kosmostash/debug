@@ -62,7 +62,13 @@ const chainOf = ({
     booleanProperties: { query: {} },
     cascadingMiddleware: cascading,
     definitionItems: route,
-    validationSchemas: {},
+    /**
+     * A params schema keeps the built-in validators in the chain, so the
+     * assertions below can show edge middleware landing ahead of them.
+     * A route with no schemas composes no validators at all - covered in
+     * validated.test.ts.
+     * */
+    validationSchemas: { params: { validate: () => {} } as never },
   };
 
   const [entry] = createRoutes<Middleware, Middleware>([routeSource], {
