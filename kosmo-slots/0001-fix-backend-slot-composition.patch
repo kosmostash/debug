@@ -1,0 +1,396 @@
+diff --git a/packages/core/src/api/routes.ts b/packages/core/src/api/routes.ts
+index 33499db..50daed2 100644
+--- a/packages/core/src/api/routes.ts
++++ b/packages/core/src/api/routes.ts
+@@ -70,6 +70,19 @@ export const createRoutes = <MiddlewareT, MiddlewareR>(
+     "validate:response",
+   ];
+ 
++  /**
++   * Whether a slot name is one this list already positions.
++   *
++   * NOTE: a plain `includes` cannot answer this - the list mixes literal names
++   * with patterns, and `edge:auth` is a member by virtue of matching `/^edge:.+/`,
++   * not by being in the array.
++   * */
++  const isPrioritizedSlot = (slot: string): boolean => {
++    return prioritizedSlots.some((entry) => {
++      return typeof entry === "string" ? entry === slot : entry.test(slot);
++    });
++  };
++
+   const stack: Array<Route<MiddlewareR>> = [];
+ 
+   // Iterate over each route definition
+@@ -421,31 +434,71 @@ export const createRoutes = <MiddlewareT, MiddlewareR>(
+       (e) => e.kind === "middleware",
+     );
+ 
+-    // NOTE: should be built in exactly this order
+-    const middlewareStack: Array<MiddlewareDefinition<MiddlewareT>> = [
+-      // per-route defined middleware - highest priority
+-      ...routeMiddleware,
+-      // global middleware defined in api/use.ts
++    /**
++     * Every user-authored declaration of a slot, outermost first:
++     * `api/use.ts`, then the cascading `use.ts` files, then the route itself.
++     * */
++    const slotDeclarations: Array<MiddlewareDefinition<MiddlewareT>> = [
+       ...globalMiddleware,
+-      // built-in middleware
++      ...routeMiddleware,
++    ];
++
++    // built-in middleware, the fallback owner of the slots it ships with
++    const builtinMiddleware: Array<MiddlewareDefinition<MiddlewareT>> = [
+       ...edgeMiddleware,
+       ...validationMiddleware,
+     ];
+ 
++    /**
++     * The middleware that owns a slot.
++     *
++     * A slot is a named position with exactly one occupant: the innermost
++     * declaration wins, so a route's `use` replaces a cascading `use.ts` entry,
++     * which in turn replaces the global one - and any of them replaces the built-in.
++     * Position is decided separately, by the outermost declaration, so an override
++     * substitutes an implementation without moving the slot.
++     * */
++    const resolveSlot = (
++      slot: string,
++    ): MiddlewareDefinition<MiddlewareT> | undefined => {
++      return (
++        slotDeclarations.findLast((e) => e.options?.slot === slot) ||
++        builtinMiddleware.find((e) => e.options?.slot === slot)
++      );
++    };
++
+     const routeStack: Array<
+       MiddlewareDefinition<MiddlewareT> | HandlerDefinition<MiddlewareT>
+     > = [
+       ...prioritizedSlots.flatMap((slot) => {
+-        const middleware = middlewareStack.find(({ options }) => {
+-          return options?.slot
+-            ? typeof slot === "string"
+-              ? options.slot === slot
+-              : slot.test(String(options.slot))
+-            : false;
++        if (typeof slot === "string") {
++          const middleware = resolveSlot(slot);
++          return middleware //
++            ? [middleware]
++            : [];
++        }
++
++        /**
++         * A pattern entry (`edge:*`) is a family of slots, not a single position:
++         * each distinct name in it gets its own place in the chain, in the order
++         * the names were first declared, so `edge:ratelimit` and `edge:auth`
++         * both run at the edge and either can be overridden on its own.
++         * */
++        const slotNames: Array<string> = [];
++
++        for (const { options } of slotDeclarations) {
++          const name = options?.slot;
++          if (name && slot.test(name) && !slotNames.includes(name)) {
++            slotNames.push(name);
++          }
++        }
++
++        return slotNames.flatMap((name) => {
++          const middleware = resolveSlot(name);
++          return middleware //
++            ? [middleware]
++            : [];
+         });
+-        return middleware //
+-          ? [middleware]
+-          : [];
+       }),
+ 
+       ...globalMiddleware.flatMap((entry) => {
+@@ -453,14 +506,15 @@ export const createRoutes = <MiddlewareT, MiddlewareR>(
+           // no slot, including regardless
+           return [entry];
+         }
+-        if (prioritizedSlots.includes(entry.options.slot)) {
++        if (isPrioritizedSlot(entry.options.slot)) {
+           // already picked when inserted prioritized middleware, excluding
+           return [];
+         }
+-        const override = routeMiddleware.find(
+-          (e) => e.options?.slot === entry.options?.slot,
+-        );
+-        return [override || entry];
++        // this declaration holds the position, an inner one may own the slot
++        const middleware = resolveSlot(entry.options.slot);
++        return middleware //
++          ? [middleware]
++          : [];
+       }),
+ 
+       ...definitionItems.flatMap((entry) => {
+@@ -470,7 +524,7 @@ export const createRoutes = <MiddlewareT, MiddlewareR>(
+             : undefined;
+ 
+         if (slot) {
+-          if (prioritizedSlots.includes(slot)) {
++          if (isPrioritizedSlot(slot)) {
+             // already picked when inserted prioritized middleware, excluding
+             return [];
+           }
+@@ -478,6 +532,15 @@ export const createRoutes = <MiddlewareT, MiddlewareR>(
+             // already picked when inserted global middleware, excluding
+             return [];
+           }
++          if (routeMiddleware.find((e) => e.options?.slot === slot) !== entry) {
++            // an outer declaration already holds this slot's position, excluding
++            return [];
++          }
++          // this declaration holds the position, an inner one may own the slot
++          const middleware = resolveSlot(slot);
++          return middleware //
++            ? [middleware]
++            : [];
+         }
+ 
+         return [entry];
+diff --git a/packages/core/test/api/slots.test.ts b/packages/core/test/api/slots.test.ts
+new file mode 100644
+index 0000000..140ca81
+--- /dev/null
++++ b/packages/core/test/api/slots.test.ts
+@@ -0,0 +1,233 @@
++import { describe, expect, test } from "vitest";
++
++import { createRoutes } from "../../src/api/routes";
++import type {
++  HandlerDefinition,
++  MiddlewareDefinition,
++  RouteSource,
++} from "../../src/api/types";
++import { use } from "../../src/api/use";
++
++/**
++ * Custom slot names are declared by the project in `api/env.d.ts`;
++ * this is the same augmentation, scoped to the test.
++ * */
++declare module "../../src/api/types" {
++  interface UseSlots {
++    logger: string;
++  }
++}
++
++type Middleware = (ctx: unknown, next: Function) => unknown;
++
++/**
++ * A named no-op middleware - the chain is asserted by function name,
++ * which is also what the route debug output prints.
++ * */
++const middleware = (name: string): Middleware => {
++  const fn: Middleware = (_ctx, next) => next();
++  Object.defineProperty(fn, "name", { value: name });
++  return fn;
++};
++
++const GET = (fn: Middleware): HandlerDefinition<Middleware> => {
++  return { kind: "handler", method: "GET", middleware: [fn] };
++};
++
++/**
++ * Names of the middleware a GET request runs, in order.
++ * Built-in validators are anonymous, so they surface as "".
++ * */
++const chainOf = ({
++  global = [],
++  cascading = [],
++  route = [GET(middleware("handler"))],
++}: {
++  // api/use.ts
++  global?: Array<MiddlewareDefinition<Middleware>>;
++  // a folder-level use.ts
++  cascading?: Array<MiddlewareDefinition<Middleware>>;
++  // the route's own definition items
++  route?: Array<
++    MiddlewareDefinition<Middleware> | HandlerDefinition<Middleware>
++  >;
++}): Array<string> => {
++  const routeSource: RouteSource<Middleware> = {
++    name: "demo",
++    path: "/demo",
++    pathPattern: "/demo",
++    file: "demo/index.ts",
++    params: [],
++    numericProperties: { params: [], query: {} },
++    booleanProperties: { query: {} },
++    cascadingMiddleware: cascading,
++    definitionItems: route,
++    validationSchemas: {},
++  };
++
++  const [entry] = createRoutes<Middleware, Middleware>([routeSource], {
++    productionBuild: false,
++    createMetaparsers: () => ({}) as never,
++    createBodyparsers: () => ({}) as never,
++    responseResolver: () => {
++      return {
++        status: 200,
++        contentType: null,
++        body: async () => undefined,
++      };
++    },
++    globalMiddleware: global,
++  });
++
++  return entry.middleware.map((fn) => (fn as Function).name);
++};
++
++describe("slot composition", () => {
++  describe("edge slots", () => {
++    test("an edge slot runs once, at the edge", () => {
++      expect(
++        chainOf({
++          global: [use(middleware("authenticate"), { slot: "edge:auth" })],
++        }),
++      ).toEqual(["useExtendContext", "authenticate", "", "handler"]);
++    });
++
++    test("every edge slot reaches the edge, in declaration order", () => {
++      expect(
++        chainOf({
++          global: [
++            use(middleware("rateLimit"), { slot: "edge:ratelimit" }),
++            use(middleware("authenticate"), { slot: "edge:auth" }),
++          ],
++        }),
++      ).toEqual([
++        "useExtendContext",
++        "rateLimit",
++        "authenticate",
++        "",
++        "handler",
++      ]);
++    });
++
++    test("a route override replaces its own slot and leaves the others", () => {
++      expect(
++        chainOf({
++          global: [
++            use(middleware("rateLimit"), { slot: "edge:ratelimit" }),
++            use(middleware("authenticate"), { slot: "edge:auth" }),
++          ],
++          route: [
++            use(middleware("verifySignature"), { slot: "edge:auth" }),
++            GET(middleware("handler")),
++          ],
++        }),
++      ).toEqual([
++        "useExtendContext",
++        "rateLimit",
++        "verifySignature",
++        "",
++        "handler",
++      ]);
++    });
++
++    test("a cascading use.ts overrides the global entry for its subtree", () => {
++      expect(
++        chainOf({
++          global: [use(middleware("authenticate"), { slot: "edge:auth" })],
++          cascading: [use(middleware("subtreeAuth"), { slot: "edge:auth" })],
++        }),
++      ).toEqual(["useExtendContext", "subtreeAuth", "", "handler"]);
++    });
++
++    test("a route-only edge slot runs at the edge with nothing to replace", () => {
++      expect(
++        chainOf({
++          route: [
++            use(middleware("audit"), { slot: "edge:audit" }),
++            GET(middleware("handler")),
++          ],
++        }),
++      ).toEqual(["useExtendContext", "audit", "", "handler"]);
++    });
++
++    test("the bare edge slot is overridable", () => {
++      expect(
++        chainOf({
++          global: [use(middleware("myOwnEdge"), { slot: "edge" })],
++        }),
++      ).toEqual(["myOwnEdge", "", "handler"]);
++    });
++  });
++
++  describe("named slots", () => {
++    test("the innermost declaration wins, keeping the outermost position", () => {
++      expect(
++        chainOf({
++          global: [use(middleware("globalLogger"), { slot: "logger" })],
++          cascading: [use(middleware("cascadingLogger"), { slot: "logger" })],
++          route: [
++            use(middleware("routeLogger"), { slot: "logger" }),
++            GET(middleware("handler")),
++          ],
++        }),
++      ).toEqual(["useExtendContext", "", "routeLogger", "handler"]);
++    });
++
++    test("a slot with no global counterpart still overrides", () => {
++      expect(
++        chainOf({
++          cascading: [use(middleware("cascadingLogger"), { slot: "logger" })],
++          route: [
++            use(middleware("routeLogger"), { slot: "logger" }),
++            GET(middleware("handler")),
++          ],
++        }),
++      ).toEqual(["useExtendContext", "", "routeLogger", "handler"]);
++    });
++
++    test("unslotted global middleware keeps running after validation", () => {
++      expect(chainOf({ global: [use(middleware("requestId"))] })).toEqual([
++        "useExtendContext",
++        "",
++        "requestId",
++        "handler",
++      ]);
++    });
++  });
++
++  describe("validation slots", () => {
++    test("a cascading use.ts overrides the global validators", () => {
++      expect(
++        chainOf({
++          global: [
++            use(middleware("globalParams"), { slot: "validate:params" }),
++            use(middleware("globalJson"), { slot: "validate:json" }),
++          ],
++          cascading: [
++            use(middleware("cascadingParams"), { slot: "validate:params" }),
++            use(middleware("cascadingJson"), { slot: "validate:json" }),
++          ],
++        }),
++      ).toEqual([
++        "useExtendContext",
++        "cascadingParams",
++        "cascadingJson",
++        "handler",
++      ]);
++    });
++
++    test("a route use() overrides a cascading validator", () => {
++      expect(
++        chainOf({
++          cascading: [
++            use(middleware("cascadingParams"), { slot: "validate:params" }),
++          ],
++          route: [
++            use(middleware("routeParams"), { slot: "validate:params" }),
++            GET(middleware("handler")),
++          ],
++        }),
++      ).toEqual(["useExtendContext", "routeParams", "handler"]);
++    });
++  });
++});
