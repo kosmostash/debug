@@ -32,6 +32,7 @@ re-exporting them with `?raw`:
 ```
 @fixtures/sidecar/
 ├── index.ts
+├── kosmo.config.hbs      the folder config, `run` behind an {{#if}}
 ├── entry.hbs             defineService, a timer, logs every lifecycle call
 ├── serving-entry.hbs     the same holding a socket; {{#if failStartOn}} makes start() throw
 ├── tick.hbs              the dependency a test edits to provoke a reload
@@ -45,8 +46,24 @@ re-exporting them with `?raw`:
 whatever it carries - which is why they appear unquoted in the templates.
 
 Rendered output was checked by eye under `KEEP_PROJECT=1`, including the
-`failStartOn` branch: handlebars strips the standalone block lines, so indentation
-comes out as written.
+`failStartOn` and `run` branches: handlebars strips the standalone block lines,
+so indentation comes out as written.
+
+### Two fixes in the harness
+
+Both latent - no current test trips either, and both were found by probing rather
+than by a red suite.
+
+- `writeConfig` wrote `serve: true` for an explicit `serve: false`:
+  `serve === undefined ? false : true` maps both `true` and `false` onto `true`.
+  Now `serve ?? false`. (`typecheck` next to it already had the right shape,
+  which is what made it look like a slip.)
+- `writeSource` called `mkdir(dirname(file))` on the *relative* path, so a nested
+  target created a stray directory next to the repo root and then failed to write:
+  `writeSource("nested/dep.ts", ...)` made `<repo>/nested` and threw ENOENT on
+  `<project>/src/worker/nested/dep.ts`. Now `dirname(createPath.src(file))`.
+  Top-level writes were unaffected - `dirname("tick.ts")` is `"."`, so the mkdir
+  was a no-op, which is why 18 tests never noticed.
 
 ## Two fixes in `chassis.ts`
 

@@ -1,0 +1,12 @@
+import { defineConfig } from "@kosmojs/dev";
+
+export default defineConfig({
+  sidecar: {
+    entry: "{{entry}}",
+    {{#if run}}
+    run: "{{run}}",
+    {{/if}}
+    serve: {{serve}},
+  },
+  typecheck: {{typecheck}},
+});

@@ -6,6 +6,7 @@
  * they appear unquoted in the templates.
  * */
 
+export { default as config } from "./kosmo.config.hbs?raw";
 export { default as entry } from "./entry.hbs?raw";
 export { default as servingEntry } from "./serving-entry.hbs?raw";
 export { default as tick } from "./tick.hbs?raw";

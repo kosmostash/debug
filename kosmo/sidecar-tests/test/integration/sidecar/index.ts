@@ -9,9 +9,7 @@ import { createJiti } from "jiti";
 import { createHTTPFolder, createSidecarFolder } from "@kosmojs/cli";
 import type { ProjectSettings, SourceFolder } from "@kosmojs/core";
 import chassis from "@kosmojs/dev/chassis";
-import { pathResolver, render } from "@kosmojs/lib";
-
-import * as templates from "../@fixtures/sidecar";
+import { pathResolver, render, renderToFile } from "@kosmojs/lib";
 
 import {
   buildProject,
@@ -21,6 +19,7 @@ import {
   installDependencies,
   pkgsDir,
 } from "..";
+import * as templates from "../@fixtures/sidecar";
 
 type SidecarConfig = {
   entry?: string;
@@ -75,11 +74,6 @@ export const setupSidecarProject = async ({
   // the templates place it as a literal, so it survives any path
   const logFileLiteral = JSON.stringify(logFile);
 
-  const writeFile_ = async (path: string, content: string) => {
-    await mkdir(dirname(path), { recursive: true });
-    await writeFile(path, content, "utf8");
-  };
-
   return {
     devPort,
     projectRoot,
@@ -122,26 +116,19 @@ export const setupSidecarProject = async ({
       serve,
       typecheck,
     }: SidecarConfig) {
-      await writeFile_(
-        createPath.src("kosmo.config.ts"),
-        [
-          `import { defineConfig } from "@kosmojs/dev";`,
-          `export default defineConfig({`,
-          `  sidecar: {`,
-          `    entry: ${JSON.stringify(entry)},`,
-          ...(run === undefined ? [] : [`    run: ${JSON.stringify(run)},`]),
-          ...(serve === undefined ? [] : [`    serve: ${serve},`]),
-          `  },`,
-          ...(typecheck === undefined ? [] : [`  typecheck: ${typecheck},`]),
-          `});`,
-          ``,
-        ].join("\n"),
-      );
+      await renderToFile(createPath.src("kosmo.config.ts"), templates.config, {
+        entry,
+        run,
+        serve: JSON.stringify(serve ?? false),
+        typecheck: JSON.stringify(typecheck === undefined ? true : typecheck),
+      });
     },
 
     /** Write any file inside the source folder, e.g. "entry.ts", "lib/tick.ts". */
-    writeSource(file: string, content: string) {
-      return writeFile_(createPath.src(file), content);
+    async writeSource(file: string, content: string) {
+      const path = createPath.src(file);
+      await mkdir(dirname(path), { recursive: true });
+      await writeFile(path, content, "utf8");
     },
 
     /**
@@ -227,10 +214,7 @@ export const setupSidecarProject = async ({
         const { stdout, stderr } = await execFile(
           process.execPath,
           [bin, ...args],
-          {
-            cwd: projectRoot,
-            env,
-          },
+          { cwd: projectRoot, env },
         );
         return { code: 0, stdout, stderr };
       } catch (error) {
