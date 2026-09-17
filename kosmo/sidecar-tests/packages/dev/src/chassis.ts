@@ -334,6 +334,13 @@ export default async (
           const next = await loadService();
           await service.teardown?.();
           await close();
+          /**
+           * Nothing is running between here and `start()`, so drop the closer:
+           * a `start()` that throws would otherwise leave the next reload
+           * calling it a second time, which for a real one throws too - and
+           * the sidecar never comes back.
+           * */
+          close = async () => {};
           service = next;
           close = await service.start();
         } catch (error) {

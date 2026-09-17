@@ -88,7 +88,7 @@ index f4670548..b50ef8ad 100644
      "test:integration:csr": "vitest run --project=integration:csr",
      "test:integration:ssr": "vitest run --project=integration:ssr",
 diff --git a/packages/dev/src/chassis.ts b/packages/dev/src/chassis.ts
-index 317a5c24..4a49dea9 100644
+index 317a5c24..cd3afc86 100644
 --- a/packages/dev/src/chassis.ts
 +++ b/packages/dev/src/chassis.ts
 @@ -4,7 +4,12 @@ import { join, posix, resolve } from "node:path";
@@ -159,7 +159,7 @@ index 317a5c24..4a49dea9 100644
              resolve: {
                conditions: ["node"],
              },
-@@ -279,23 +320,30 @@ export default async (
+@@ -279,23 +320,37 @@ export default async (
        let service = await loadService();
        let close = await service.start();
  
@@ -192,6 +192,13 @@ index 317a5c24..4a49dea9 100644
 +          const next = await loadService();
 +          await service.teardown?.();
 +          await close();
++          /**
++           * Nothing is running between here and `start()`, so drop the closer:
++           * a `start()` that throws would otherwise leave the next reload
++           * calling it a second time, which for a real one throws too - and
++           * the sidecar never comes back.
++           * */
++          close = async () => {};
 +          service = next;
 +          close = await service.start();
 +        } catch (error) {
@@ -366,10 +373,10 @@ index e2492a5a..c8b963ab 100644
          provide: {
 diff --git a/test/integration/sidecar/index.ts b/test/integration/sidecar/index.ts
 new file mode 100644
-index 00000000..af577777
+index 00000000..1d5e0f43
 --- /dev/null
 +++ b/test/integration/sidecar/index.ts
-@@ -0,0 +1,316 @@
+@@ -0,0 +1,326 @@
 +import child_process from "node:child_process";
 +import { mkdir, mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
 +import { tmpdir } from "node:os";
@@ -553,8 +560,11 @@ index 00000000..af577777
 +     * I/O and throws if called twice, which is what a reload has to avoid
 +     * doing after one that failed. Binds an ephemeral port: nothing in the
 +     * test talks to it, only the lifecycle matters.
++     *
++     * `failStartOn` makes `start()` throw for one tick value, so a test can
++     * provoke the other way a reload fails.
 +     * */
-+    servingEntry() {
++    servingEntry({ failStartOn }: { failStartOn?: string } = {}) {
 +      return [
 +        `import { appendFileSync } from "node:fs";`,
 +        `import { createServer } from "node:http";`,
@@ -569,6 +579,13 @@ index 00000000..af577777
 +        ``,
 +        `export default defineService({`,
 +        `  async start() {`,
++        ...(failStartOn
++          ? [
++              `    if (tick === ${JSON.stringify(failStartOn)}) {`,
++              `      throw new Error("start failed");`,
++              `    }`,
++            ]
++          : []),
 +        `    const server = createServer((_req, res) => res.end(tick));`,
 +        `    await new Promise<void>((resolve) => {`,
 +        `      server.listen(0, () => resolve());`,
@@ -844,18 +861,21 @@ index 00000000..bc4d9e37
 +});
 diff --git a/test/integration/sidecar/reload-failure.test.ts b/test/integration/sidecar/reload-failure.test.ts
 new file mode 100644
-index 00000000..ace887c0
+index 00000000..365d5b5c
 --- /dev/null
 +++ b/test/integration/sidecar/reload-failure.test.ts
-@@ -0,0 +1,43 @@
+@@ -0,0 +1,80 @@
 +import { afterAll, beforeAll, describe, expect, test } from "vitest";
 +
 +import { setupSidecarProject } from ".";
 +
 +/**
-+ * A service holding a socket, so its close function does real work and cannot
-+ * run twice - the shape that turns a mishandled failed reload into a sidecar
-+ * that never comes back.
++ * A service holding a socket, so its close function does real work and throws
++ * if called twice - the shape that turns a mishandled failed reload into a
++ * sidecar that never comes back, however many times you save afterwards.
++ *
++ * The two ways a reload fails are covered in order against one dev server,
++ * because what matters is that the state each leaves behind is still reloadable.
 + * */
 +const project = await setupSidecarProject({
 +  name: "worker",
@@ -865,7 +885,10 @@ index 00000000..ace887c0
 +beforeAll(async () => {
 +  await project.bootstrap();
 +  await project.writeSource("tick.ts", project.tickModule("1"));
-+  await project.writeSource("entry.ts", project.servingEntry());
++  await project.writeSource(
++    "entry.ts",
++    project.servingEntry({ failStartOn: "boom" }),
++  );
 +  await project.startDevServer();
 +  await project.waitForLog(1);
 +}, 180_000);
@@ -874,20 +897,51 @@ index 00000000..ace887c0
 +  await project.teardown();
 +});
 +
-+describe("a reload that throws", () => {
++const settle = () => new Promise((resolve) => setTimeout(resolve, 2000));
++
++describe("a save that cannot compile", () => {
 +  test("leaves the running service untouched", async () => {
 +    await project.writeSource("tick.ts", "export const tick = ;\n");
-+    await new Promise((resolve) => setTimeout(resolve, 1500));
++    await settle();
 +
-+    // nothing was torn down: closing before knowing the new source compiles
-+    // would leave the service shut with nothing to replace it
++    // the import is what throws, and it runs before anything is torn down
 +    expect(await project.readLog()).toEqual(["start:1"]);
 +  });
 +
 +  test("the next good save reloads it", async () => {
 +    await project.writeSource("tick.ts", project.tickModule("2"));
-+    await new Promise((resolve) => setTimeout(resolve, 2000));
++    await settle();
 +
 +    expect(await project.readLog()).toEqual(["start:1", "close:1", "start:2"]);
++  });
++});
++
++describe("a start() that throws", () => {
++  test("stops the old service and leaves nothing running", async () => {
++    await project.writeSource("tick.ts", project.tickModule("boom"));
++    await settle();
++
++    // the old one is closed by then - the new one simply never came up
++    expect(await project.readLog()).toEqual([
++      "start:1",
++      "close:1",
++      "start:2",
++      "close:2",
++    ]);
++  });
++
++  test("the next good save still reloads it", async () => {
++    await project.writeSource("tick.ts", project.tickModule("3"));
++    await settle();
++
++    // only if the closer of the service that never started was dropped;
++    // calling the previous one again throws and wedges every later save
++    expect(await project.readLog()).toEqual([
++      "start:1",
++      "close:1",
++      "start:2",
++      "close:2",
++      "start:3",
++    ]);
 +  });
 +});

@@ -181,8 +181,11 @@ export const setupSidecarProject = async ({
      * I/O and throws if called twice, which is what a reload has to avoid
      * doing after one that failed. Binds an ephemeral port: nothing in the
      * test talks to it, only the lifecycle matters.
+     *
+     * `failStartOn` makes `start()` throw for one tick value, so a test can
+     * provoke the other way a reload fails.
      * */
-    servingEntry() {
+    servingEntry({ failStartOn }: { failStartOn?: string } = {}) {
       return [
         `import { appendFileSync } from "node:fs";`,
         `import { createServer } from "node:http";`,
@@ -197,6 +200,13 @@ export const setupSidecarProject = async ({
         ``,
         `export default defineService({`,
         `  async start() {`,
+        ...(failStartOn
+          ? [
+              `    if (tick === ${JSON.stringify(failStartOn)}) {`,
+              `      throw new Error("start failed");`,
+              `    }`,
+            ]
+          : []),
         `    const server = createServer((_req, res) => res.end(tick));`,
         `    await new Promise<void>((resolve) => {`,
         `      server.listen(0, () => resolve());`,
