@@ -1,0 +1,609 @@
+diff --git a/package.json b/package.json
+index f4670548..b50ef8ad 100644
+--- a/package.json
++++ b/package.json
+@@ -17,6 +17,7 @@
+     "test:unit:packages": "vitest run --project=packages/*",
+     "test:integration": "vitest run --project=\"integration:*\"",
+     "test:integration:cli": "vitest run --project=integration:cli",
++    "test:integration:sidecar": "vitest run --project=integration:sidecar",
+     "test:integration:backend": "vitest run --project=integration:backend",
+     "test:integration:csr": "vitest run --project=integration:csr",
+     "test:integration:ssr": "vitest run --project=integration:ssr",
+diff --git a/test/integration/cli/folders.test.ts b/test/integration/cli/folders.test.ts
+index cbbca4ef..4cd53c69 100644
+--- a/test/integration/cli/folders.test.ts
++++ b/test/integration/cli/folders.test.ts
+@@ -1,4 +1,4 @@
+-import { mkdir, readdir, rm } from "node:fs/promises";
++import { mkdir, readdir, readFile, rm } from "node:fs/promises";
+ import { join, resolve } from "node:path";
+ 
+ import { afterEach, describe, expect, test } from "vitest";
+@@ -219,3 +219,107 @@ describe("folder: flag matrix", async () => {
+     }
+   });
+ });
++
++describe("sidecar: scaffolding", async () => {
++  const createSidecar = async (args: Array<string>) => {
++    await mkdir(tempDir, { recursive: true });
++
++    const projectName = "test";
++    const projectRoot = resolve(tempDir, projectName);
++
++    // create host project
++    await run(
++      createBin,
++      [projectName, "--no-frontend", "--no-backend"],
++      tempDir,
++    );
++
++    const result = await run(kosmoBin, ["sidecar", ...args], projectRoot);
++
++    const folderPath = resolve(projectRoot, join(defaults.srcDir, args[0] || ""));
++
++    return {
++      entries: await readdir(folderPath).catch(() => []),
++      config: await readFile(resolve(folderPath, "kosmo.config.ts"), "utf8") //
++        .catch(() => ""),
++      ...result,
++    };
++  };
++
++  test("seeds the entry, the runner and a folder tsconfig", async () => {
++    const { code, entries } = await createSidecar(["mailer"]);
++
++    expect(code).toEqual(0);
++    expect(entries.sort()).toEqual([
++      "entry.ts",
++      "kosmo.config.ts",
++      "run.ts",
++      "tsconfig.json",
++    ]);
++  });
++
++  test("seeds no route folders - a sidecar serves nothing", async () => {
++    const { code, entries } = await createSidecar(["mailer"]);
++
++    expect(code).toEqual(0);
++    expect(entries).not.toContain("api");
++    expect(entries).not.toContain("pages");
++  });
++
++  test("writes a sidecar block pointing at both seeded files", async () => {
++    const { code, config } = await createSidecar(["mailer"]);
++
++    expect(code).toEqual(0);
++    expect(config).toMatch(/sidecar:\s*\{/);
++    expect(config).toMatch(/entry:\s*"\.\/entry\.ts"/);
++    expect(config).toMatch(/run:\s*"\.\/run\.ts"/);
++    // off by default: starting it under the dev server is opt-in
++    expect(config).toMatch(/serve:\s*false/);
++  });
++
++  test("declares neither frontend nor backend", async () => {
++    const { code, config } = await createSidecar(["mailer"]);
++
++    expect(code).toEqual(0);
++    expect(config).not.toMatch(/frontend:/);
++    expect(config).not.toMatch(/backend:/);
++  });
++
++  test("missing name fails", async () => {
++    const { code, stderr } = await createSidecar([]);
++
++    expect(code).not.toEqual(0);
++    expect(stderr).toMatch(/No sidecar name provided/);
++  });
++
++  test("existing dir fails", async () => {
++    const { code } = await createSidecar(["mailer"]);
++
++    expect(code).toEqual(0);
++
++    {
++      const { code, stderr } = await createSidecar(["mailer"]);
++      expect(code).not.toEqual(0);
++      expect(stderr).toMatch(/already exists/);
++    }
++  });
++
++  test("existing dir succeeds with --overwrite", async () => {
++    const { code } = await createSidecar(["mailer"]);
++
++    expect(code).toEqual(0);
++
++    {
++      const { code } = await createSidecar(["mailer", "--overwrite"]);
++      expect(code).toEqual(0);
++    }
++  });
++
++  test("unknown option fails with a clean error, not a stack trace", async () => {
++    const { code, stderr } = await createSidecar(["mailer", "--unknown-option"]);
++
++    expect(code).not.toEqual(0);
++    expect(stderr).toMatch("Unknown option '--unknown-option'");
++    expect(stderr).not.toMatch(/ERR_PARSE_ARGS_UNKNOWN_OPTION/);
++  });
++});
+diff --git a/test/integration/setup.ts b/test/integration/setup.ts
+index 26acb4fb..553f4226 100644
+--- a/test/integration/setup.ts
++++ b/test/integration/setup.ts
+@@ -565,7 +565,7 @@ export const snapshotNameFor = (
+   ].join("/");
+ };
+ 
+-const findFreePort = async (): Promise<number> => {
++export const findFreePort = async (): Promise<number> => {
+   const [minPort] = PORT_RANGE;
+ 
+   for (let i = 0; i < PORTS_PER_WORKER; i++) {
+diff --git a/test/package.json b/test/package.json
+index 0d157a0e..61cd9cdd 100644
+--- a/test/package.json
++++ b/test/package.json
+@@ -9,6 +9,7 @@
+     "test:unit:packages": "pnpm -C .. run test:unit:packages",
+     "test:integration": "pnpm -C .. run test:integration",
+     "test:integration:cli": "pnpm -C .. run test:integration:cli",
++    "test:integration:sidecar": "pnpm -C .. run test:integration:sidecar",
+     "test:integration:backend": "pnpm -C .. run test:integration:backend",
+     "test:integration:csr": "pnpm -C .. run test:integration:csr",
+     "test:integration:ssr": "pnpm -C .. run test:integration:ssr",
+diff --git a/vitest.config.js b/vitest.config.js
+index e2492a5a..c8b963ab 100644
+--- a/vitest.config.js
++++ b/vitest.config.js
+@@ -92,6 +92,10 @@ export default defineConfig({
+         include: ["integration/cli/*.test.ts"],
+       }),
+ 
++      setupFactory("integration:sidecar", {
++        include: ["integration/sidecar/*.test.ts"],
++      }),
++
+       setupFactory("integration:backend", {
+         include: ["integration/{hono,h3,koa}/*.test.ts"],
+         provide: {
+diff --git a/test/integration/sidecar/index.ts b/test/integration/sidecar/index.ts
+new file mode 100644
+index 00000000..b711e4b9
+--- /dev/null
++++ b/test/integration/sidecar/index.ts
+@@ -0,0 +1,278 @@
++import child_process from "node:child_process";
++import { mkdir, mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
++import { tmpdir } from "node:os";
++import { dirname, resolve } from "node:path";
++
++import { createJiti } from "jiti";
++
++import { createSidecarFolder, createSourceFolder } from "@kosmojs/cli";
++import type { ProjectSettings, SourceFolder } from "@kosmojs/core";
++import chassis from "@kosmojs/dev/chassis";
++import { pathResolver } from "@kosmojs/lib";
++import { createProject } from "create-kosmo";
++
++import { env, exec } from "..";
++import { findFreePort } from "../setup";
++
++const pnpmDir = resolve(tmpdir(), ".kosmojs/pnpm-store");
++
++type SidecarConfig = {
++  entry?: string;
++  run?: string;
++  serve?: boolean;
++};
++
++/**
++ * A sidecar project driven the way a user drives one - scaffolded by the CLI,
++ * installed, then either built (`pnpm build`) or served (chassis in-process).
++ *
++ * Deliberately not `setupTestProject`: that one is built around a folder that
++ * serves HTTP - pages, api routes, a browser - and a sidecar has none of it.
++ * */
++export const setupSidecarProject = async ({
++  name = "worker",
++  sidecar = {},
++  webFolder,
++}: {
++  name?: string;
++  sidecar?: SidecarConfig;
++  // a second, HTTP-serving folder - the layout the docs recommend
++  webFolder?: { name: string; base: string };
++} = {}) => {
++  const devPort = await findFreePort();
++  const tempDir = await mkdtemp(resolve(tmpdir(), ".kosmojs-sidecar-"));
++  const projectRoot = resolve(tempDir, "app");
++
++  const sourceFolder: SourceFolder = {
++    root: projectRoot,
++    name,
++    config: {},
++    generators: [],
++    distDir: "dist",
++  };
++
++  const { createPath } = pathResolver(sourceFolder);
++  const jiti = createJiti(projectRoot);
++
++  let closeServer: (() => Promise<void>) | undefined;
++  const children = new Set<child_process.ChildProcess>();
++
++  /**
++   * The service logs to a file rather than to a variable: under `kosmo serve`
++   * the entry is evaluated inside Vite's module runner, and every reload
++   * produces a fresh module instance. A file is the one channel the test and
++   * every instance of the service agree on.
++   * */
++  const logFile = resolve(tempDir, "service.log");
++
++  const writeFile_ = async (path: string, content: string) => {
++    await mkdir(dirname(path), { recursive: true });
++    await writeFile(path, content, "utf8");
++  };
++
++  return {
++    devPort,
++    projectRoot,
++    logFile,
++    createPath,
++
++    async bootstrap() {
++      const pkgsDir = resolve(import.meta.dirname, "../../../packages");
++
++      await createProject(
++        projectRoot,
++        { name: "app", devPort },
++        {
++          dependencies: { "@kosmojs/core": `${pkgsDir}/core` },
++          devDependencies: {
++            "@kosmojs/dev": `${pkgsDir}/dev`,
++            "@kosmojs/cli": `${pkgsDir}/cli`,
++          },
++        },
++      );
++
++      if (webFolder) {
++        await createSourceFolder(
++          projectRoot,
++          { name: webFolder.name, backend: "hono" },
++          { backend: { base: webFolder.base } },
++        );
++      }
++
++      await createSidecarFolder(projectRoot, { name, sidecar: true });
++
++      // the seeded config is the default one; tests state what they need
++      await this.writeConfig(sidecar);
++
++      await exec(
++        "pnpm",
++        [
++          "install",
++          "--store-dir",
++          pnpmDir,
++          "--no-frozen-lockfile",
++          "--prefer-offline",
++        ],
++        { cwd: projectRoot, env },
++      );
++    },
++
++    /** Rewrite the folder's kosmo.config.ts - `run: undefined` drops the key. */
++    async writeConfig({ entry = "./entry.ts", run, serve }: SidecarConfig) {
++      await writeFile_(
++        createPath.src("kosmo.config.ts"),
++        [
++          `import { defineConfig } from "@kosmojs/dev";`,
++          ``,
++          `export default defineConfig({`,
++          `  sidecar: {`,
++          `    entry: ${JSON.stringify(entry)},`,
++          ...(run === undefined ? [] : [`    run: ${JSON.stringify(run)},`]),
++          ...(serve === undefined ? [] : [`    serve: ${serve},`]),
++          `  },`,
++          `});`,
++          ``,
++        ].join("\n"),
++      );
++    },
++
++    /** Write any file inside the source folder, e.g. "entry.ts", "lib/tick.ts". */
++    writeSource(file: string, content: string) {
++      return writeFile_(createPath.src(file), content);
++    },
++
++    /**
++     * An entry that logs every lifecycle call and holds the event loop open,
++     * so the process behaves like a service rather than exiting at once.
++     * `tick` is imported, not inlined, so a test can edit the dependency
++     * and see whether the reloaded service picked the new source up.
++     * */
++    serviceEntry() {
++      return [
++        `import { appendFileSync } from "node:fs";`,
++        ``,
++        `import { defineService } from "_/sidecar";`,
++        ``,
++        `import { tick } from "./tick";`,
++        ``,
++        `const log = (event: string) => {`,
++        `  appendFileSync(${JSON.stringify(logFile)}, \`\${event}:\${tick}\\n\`);`,
++        `};`,
++        ``,
++        `export default defineService({`,
++        `  async start() {`,
++        `    const timer = setInterval(() => {}, 1000);`,
++        `    log("start");`,
++        `    return async () => {`,
++        `      clearInterval(timer);`,
++        `      log("close");`,
++        `    };`,
++        `  },`,
++        `  async teardown() {`,
++        `    log("teardown");`,
++        `  },`,
++        `});`,
++        ``,
++      ].join("\n");
++    },
++
++    tickModule(value: string) {
++      return `export const tick = ${JSON.stringify(value)};\n`;
++    },
++
++    /** Truncate the log so a test reads only what it provoked. */
++    async resetLog() {
++      await writeFile(logFile, "", "utf8");
++    },
++
++    async readLog(): Promise<Array<string>> {
++      const { readFile } = await import("node:fs/promises");
++      const content = await readFile(logFile, "utf8").catch(() => "");
++      return content.split("\n").filter(Boolean);
++    },
++
++    /** Wait until the log reaches `count` lines, or give up. */
++    async waitForLog(count: number, timeout = 5000): Promise<Array<string>> {
++      const deadline = Date.now() + timeout;
++      let lines = await this.readLog();
++      while (lines.length < count && Date.now() < deadline) {
++        await new Promise((r) => setTimeout(r, 50));
++        lines = await this.readLog();
++      }
++      return lines;
++    },
++
++    build() {
++      return exec("pnpm", ["build"], { cwd: projectRoot, env });
++    },
++
++    distEntries(...path: Array<string>) {
++      return readdir(createPath.distDir(...path)).catch(() => []);
++    },
++
++    /** `kosmo serve`, in this process - the same call `kosmo serve` makes. */
++    async startDevServer() {
++      const { config, generators } = await jiti.import<
++        Pick<SourceFolder, "config" | "generators">
++      >(createPath.src("kosmo.config.ts"), { default: true });
++
++      const projectSettings: ProjectSettings = {
++        root: projectRoot,
++        sourceFolders: [{ ...sourceFolder, config, generators }],
++        command: "serve",
++        distDir: sourceFolder.distDir,
++        devPort,
++        previewPort: devPort + 1,
++      };
++
++      closeServer = await chassis(projectSettings);
++    },
++
++    /** Spawn a built artifact, e.g. dist/<name>/sidecar/run.js. */
++    spawnDist(file: string) {
++      const child = child_process.spawn(
++        process.execPath,
++        [createPath.distDir(file)],
++        { cwd: projectRoot, env },
++      );
++
++      children.add(child);
++
++      let output = "";
++      child.stdout?.on("data", (d) => (output += d));
++      child.stderr?.on("data", (d) => (output += d));
++
++      return {
++        child,
++        output: () => output,
++        get running() {
++          return child.exitCode === null && child.signalCode === null;
++        },
++        /** Resolves with how it ended, or "running" if it outlived the wait. */
++        exit(timeout = 5000): Promise<string> {
++          if (child.exitCode !== null || child.signalCode !== null) {
++            return Promise.resolve(`exit ${child.signalCode ?? child.exitCode}`);
++          }
++          return Promise.race([
++            new Promise<string>((r) => {
++              child.once("exit", (code, signal) =>
++                r(`exit ${signal ?? code}`),
++              );
++            }),
++            new Promise<string>((r) => setTimeout(() => r("running"), timeout)),
++          ]);
++        },
++      };
++    },
++
++    async teardown() {
++      await closeServer?.();
++      for (const child of children) {
++        child.kill("SIGKILL");
++      }
++      if (!process.env.KEEP_PROJECT) {
++        await rm(tempDir, { recursive: true, force: true });
++      }
++    },
++  };
++};
+diff --git a/test/integration/sidecar/build.test.ts b/test/integration/sidecar/build.test.ts
+new file mode 100644
+index 00000000..f5f0362c
+--- /dev/null
++++ b/test/integration/sidecar/build.test.ts
+@@ -0,0 +1,90 @@
++import { afterAll, beforeAll, describe, expect, test } from "vitest";
++
++import { setupSidecarProject } from ".";
++
++/**
++ * One project for the whole file, in the layout the docs recommend:
++ * a sidecar folder beside an HTTP folder, built by one `pnpm build`.
++ * */
++const project = await setupSidecarProject({
++  name: "worker",
++  sidecar: { entry: "./entry.ts", run: "./run.ts" },
++  webFolder: { name: "web", base: "/api" },
++});
++
++beforeAll(async () => {
++  await project.bootstrap();
++  await project.writeSource("tick.ts", project.tickModule("1"));
++  await project.writeSource("entry.ts", project.serviceEntry());
++  await project.build();
++}, 180_000);
++
++afterAll(async () => {
++  await project.teardown();
++});
++
++describe("sidecar build", () => {
++  test("emits the entry and the runner under dist/<folder>/sidecar", async () => {
++    const entries = await project.distEntries("sidecar");
++
++    expect(entries).toContain("entry.js");
++    expect(entries).toContain("run.js");
++  });
++
++  test("the runner starts the service and stays up", async () => {
++    await project.resetLog();
++
++    const runner = project.spawnDist("sidecar/run.js");
++
++    // the service holds the event loop open; a runner that exited here would
++    // mean start() never ran, or ran and left nothing alive
++    expect(await runner.exit(2000)).toEqual("running");
++    expect(await project.readLog()).toEqual(["start:1"]);
++
++    runner.child.kill("SIGKILL");
++  });
++
++  test("SIGINT drains it through teardown and the close function", async () => {
++    await project.resetLog();
++
++    const runner = project.spawnDist("sidecar/run.js");
++
++    // start() has to have returned before the runner registers its handlers,
++    // so wait for the process to settle rather than for the log line alone
++    await project.waitForLog(1);
++    await new Promise((resolve) => setTimeout(resolve, 500));
++
++    runner.child.kill("SIGINT");
++
++    expect(await runner.exit()).toEqual("exit 0");
++
++    // teardown first, then the close function - see docs/sidecar/entry
++    expect(await project.readLog()).toEqual([
++      "start:1",
++      "teardown:1",
++      "close:1",
++    ]);
++  });
++
++  test("the dispatcher ignores a sidecar folder and serves the web one", async () => {
++    // dist/<sidecar>/ carries no kosmo.json, so dist/run.js must skip it
++    // rather than fail to boot the folders that do serve HTTP
++    const { createListener } = await import(
++      project.createPath.distDir("../run.js")
++    );
++
++    const listener = await createListener();
++
++    expect(listener).toBeTypeOf("function");
++  });
++
++  test("without `run` only the entry is emitted", async () => {
++    await project.writeConfig({ entry: "./entry.ts" });
++    await project.build();
++
++    const entries = await project.distEntries("sidecar");
++
++    expect(entries).toContain("entry.js");
++    expect(entries).not.toContain("run.js");
++  });
++});
+diff --git a/test/integration/sidecar/serve.test.ts b/test/integration/sidecar/serve.test.ts
+new file mode 100644
+index 00000000..9aae7de8
+--- /dev/null
++++ b/test/integration/sidecar/serve.test.ts
+@@ -0,0 +1,53 @@
++import { afterAll, beforeAll, describe, expect, test } from "vitest";
++
++import { setupSidecarProject } from ".";
++
++const project = await setupSidecarProject({
++  name: "worker",
++  sidecar: { entry: "./entry.ts", run: "./run.ts", serve: true },
++});
++
++beforeAll(async () => {
++  await project.bootstrap();
++  await project.writeSource("tick.ts", project.tickModule("1"));
++  await project.writeSource("entry.ts", project.serviceEntry());
++  await project.startDevServer();
++}, 180_000);
++
++afterAll(async () => {
++  await project.teardown();
++});
++
++describe("sidecar under kosmo serve", () => {
++  test("starts the service once, on boot", async () => {
++    const log = await project.waitForLog(1);
++
++    expect(log).toEqual(["start:1"]);
++  });
++
++  test("a change in the entry's graph restarts it, teardown before close", async () => {
++    await project.writeSource("tick.ts", project.tickModule("2"));
++
++    // teardown, close, start - four lines counting the boot
++    const log = await project.waitForLog(4);
++
++    expect(log.slice(0, 3)).toEqual(["start:1", "teardown:1", "close:1"]);
++  });
++
++  test("the restarted service runs the edited source", async () => {
++    const log = await project.waitForLog(4);
++
++    // the tick the restarted instance logs is the one now on disk,
++    // not the one Vite had transformed before the change
++    expect(log[3]).toEqual("start:2");
++  });
++
++  test("a file outside the graph does not restart it", async () => {
++    const before = await project.readLog();
++
++    await project.writeSource("unrelated.ts", "export const x = 1;\n");
++    await new Promise((resolve) => setTimeout(resolve, 1000));
++
++    expect(await project.readLog()).toEqual(before);
++  });
++});
