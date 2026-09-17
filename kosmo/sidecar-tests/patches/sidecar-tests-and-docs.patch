@@ -1,3 +1,59 @@
+diff --git a/docs/sidecar/development.md b/docs/sidecar/development.md
+index 0b45b47a..6987d696 100644
+--- a/docs/sidecar/development.md
++++ b/docs/sidecar/development.md
+@@ -1,11 +1,12 @@
+ ---
+ title: Sidecars in development
+-description: Running a sidecar under kosmo serve - how the reload works,
+-    and why the close function is what frees the port.
++description: Running a sidecar under kosmo serve - how the reload works, why the close
++    function is what frees the port, and when not to set serve at all.
+ head:
+   - - meta
+     - name: keywords
+-      content: sidecar serve, dev server, reload, EADDRINUSE, vite environment, hot reload
++      content: sidecar serve, dev server, reload, EADDRINUSE, vite environment, hot reload,
++        build-only sidecar, close function
+ ---
+ 
+ In dev mode, `kosmo serve` can run a sidecar alongside your app, so a worker is up while you work on the routes that feed it.
+@@ -32,6 +33,35 @@ A reload that throws is reported and the dev server stays up; the next good save
+ 
+ ---
+ 
++### When not to set it
++
++`serve` earns its keep when the service holds something open between edits -
++a socket bound, a consumer subscribed, a pool connected.
++That is what makes a restart worth doing, and the close function is what releases it.
++
++A sidecar whose `start()` holds nothing has none of that.
++There is no socket to rebind, nothing for the reload to free,
++and no state that being up between saves preserves -
++the dev server is only re-running a function that returns.
++
++Leave `serve` off and let it be a build artifact:
++
++```ts [src/mailer/kosmo.config.ts]
++export default defineConfig({
++  sidecar: {
++    entry: "./entry.ts",
++    run: "./run.ts",
++    // nothing to keep alive between edits - build it, start it yourself
++    serve: false,
++  },
++});
++```
++
++An empty close function is the tell.
++If there is nothing to put in it, there is nothing `serve: true` is keeping alive for you.
++
++---
++
+ ### Typechecking
+ 
+ Nothing to configure. A sidecar lives inside a source folder,
 diff --git a/package.json b/package.json
 index f4670548..b50ef8ad 100644
 --- a/package.json
@@ -550,7 +606,7 @@ index 00000000..f5f0362c
 +});
 diff --git a/test/integration/sidecar/serve.test.ts b/test/integration/sidecar/serve.test.ts
 new file mode 100644
-index 00000000..04f44eaa
+index 00000000..9af6608b
 --- /dev/null
 +++ b/test/integration/sidecar/serve.test.ts
 @@ -0,0 +1,64 @@
@@ -596,10 +652,10 @@ index 00000000..04f44eaa
 +   * the entry before Vite has marked the changed modules dirty, so the module
 +   * runner replays its cached transform.
 +   *
-+   * Deterministic here (5/5), and not a burst-of-saves case - a single write
-+   * does it. Any await between the change and the re-import hides it, which
-+   * is why the backend path, with a generator pass in between, does not show
-+   * it; a bare `setImmediate` yield is not enough.
++   * Deterministic (5/5), on a single write - not a burst. Nor does the work a
++   * close function does pace it: a service holding a socket, closed with
++   * `server.close()` before the reload, restarts on stale source just the same
++   * (5/5), and serves it over HTTP. A `setImmediate` yield is not enough either.
 +   *
 +   * Unskip if the reload ever orders itself after Vite's invalidation.
 +   * */

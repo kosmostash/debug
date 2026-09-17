@@ -1,19 +1,20 @@
-# Sidecar integration tests
+# Sidecar integration tests + docs
 
 Against `kosmojs/kosmo@4cd87b4f` ("feat(sidecar): a source folder that builds a standalone process").
 
 ## Contents
 
 ```
-patches/sidecar-integration-tests.patch   apply to a clean 4cd87b4f
+patches/sidecar-tests-and-docs.patch      apply to a clean 4cd87b4f
 test/integration/sidecar/                 the new suite, as files
 test/integration/cli/folders.test.ts      with the sidecar section appended
+docs/sidecar/development.md               with the "When not to set it" section
 ```
 
 The patch also carries the `integration:sidecar` vitest project, the
 `test:integration:sidecar` scripts, and `findFreePort` exported from
 `test/integration/setup.ts`. Verified with `git apply --check` against a
-pristine `4cd87b4f`. No change to `packages/`.
+pristine `4cd87b4f`. No change under `packages/`.
 
 ## Suites
 
@@ -36,21 +37,34 @@ The service logs lifecycle calls to a file rather than a variable: under `kosmo 
 the entry is evaluated inside Vite's module runner and every reload produces a fresh
 module instance, so a file is the one channel the test and every instance agree on.
 
-## The skipped case
+## The skipped case, and what it is not
 
 `serve.test.ts` parks "the restarted service runs the edited source". On one save
 the restarted service logs `start:1` - the source as it was before the change.
-The watcher handler re-imports the entry before Vite has marked the changed
-modules dirty, so the module runner replays its cached transform.
 
-Deterministic (5/5 runs), on a single write - not a burst. Any await between the
-change and the re-import hides it, which is why the backend path, with a generator
-pass in between, does not show it. A bare `setImmediate` yield is not enough
-(3/3 still stale); ~100ms is.
+Measured, so the docs do not have to guess:
 
-Left skipped rather than fixed: `invalidateModule` is the fix I measured, and it
-is deliberately not used here. Unskip if the reload ever orders itself after
-Vite's invalidation.
+| condition | result |
+|---|---|
+| single save, no-op close | stale, 5/5 runs |
+| single save, close awaiting `server.close()` on a live socket | stale, 5/5 runs - and the server then serves the stale body over HTTP |
+| `setImmediate` yield before the re-import | stale, 3/3 runs |
+| ~100ms of slack before the re-import | fresh |
+
+So the work a close function does is **not** what paces the reload: a real socket
+close resolves in about a tick, and a tick is not enough. Only `invalidateModule`
+made it deterministic, and that is deliberately unused upstream - hence skipped
+rather than fixed.
+
+## The docs change
+
+`docs/sidecar/development.md` gains a "When not to set it" section: `serve` is for a
+service that holds something open between edits, and a sidecar whose `start()` holds
+nothing gains nothing from it - leave `serve` off and build it.
+
+That argument stands on its own. It deliberately does **not** claim that a close
+function doing real work gives Vite time to register the change; the table above is
+why.
 
 ## Verification
 

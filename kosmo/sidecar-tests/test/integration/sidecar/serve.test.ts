@@ -40,10 +40,10 @@ describe("sidecar under kosmo serve", () => {
    * the entry before Vite has marked the changed modules dirty, so the module
    * runner replays its cached transform.
    *
-   * Deterministic here (5/5), and not a burst-of-saves case - a single write
-   * does it. Any await between the change and the re-import hides it, which
-   * is why the backend path, with a generator pass in between, does not show
-   * it; a bare `setImmediate` yield is not enough.
+   * Deterministic (5/5), on a single write - not a burst. Nor does the work a
+   * close function does pace it: a service holding a socket, closed with
+   * `server.close()` before the reload, restarts on stale source just the same
+   * (5/5), and serves it over HTTP. A `setImmediate` yield is not enough either.
    *
    * Unskip if the reload ever orders itself after Vite's invalidation.
    * */
