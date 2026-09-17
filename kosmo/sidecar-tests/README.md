@@ -44,17 +44,27 @@ the restarted service logs `start:1` - the source as it was before the change.
 
 Measured, so the docs do not have to guess:
 
-| condition | result |
-|---|---|
-| single save, no-op close | stale, 5/5 runs |
-| single save, close awaiting `server.close()` on a live socket | stale, 5/5 runs - and the server then serves the stale body over HTTP |
-| `setImmediate` yield before the re-import | stale, 3/3 runs |
-| ~100ms of slack before the re-import | fresh |
+| condition | gap before re-import | result |
+|---|---|---|
+| no-op close | 0.08ms | stale, 5/5 runs |
+| close awaiting `server.close()` on a live socket | ~1 tick | stale, 5/5 - and the server serves the stale body over HTTP |
+| `setImmediate` yield | ~0ms | stale, 3/3 |
+| `setTimeout` 1ms | 1.14ms | **fresh** |
+| `setTimeout` 2 / 5 / 10 / 25 / 50ms | 2.3 - 49.9ms | fresh |
 
-So the work a close function does is **not** what paces the reload: a real socket
-close resolves in about a tick, and a tick is not enough. Only `invalidateModule`
-made it deterministic, and that is deliberately unused upstream - hence skipped
-rather than fixed.
+So the line sits just above one tick - but it is the *kind* of yield that matters,
+not the duration: `setImmediate` and a socket-close callback both clear less than
+a timer does and both stay stale. Only `invalidateModule` made it deterministic,
+and that is deliberately unused upstream - hence skipped rather than fixed.
+
+### The backend path is not affected
+
+Measured the same way: five edits under `kosmo serve` - three to a module a route
+imports, two to the route file itself - all served the edited source. Its reload
+puts the generator pass between the change and the re-import, worth **21-34ms**
+of real fs work, well clear of the ~1ms line.
+
+Safe by margin rather than by design, but a 20x one.
 
 ## The docs change
 

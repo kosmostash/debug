@@ -40,10 +40,16 @@ describe("sidecar under kosmo serve", () => {
    * the entry before Vite has marked the changed modules dirty, so the module
    * runner replays its cached transform.
    *
-   * Deterministic (5/5), on a single write - not a burst. Nor does the work a
-   * close function does pace it: a service holding a socket, closed with
-   * `server.close()` before the reload, restarts on stale source just the same
-   * (5/5), and serves it over HTTP. A `setImmediate` yield is not enough either.
+   * Deterministic (5/5), on a single write - not a burst.
+   *
+   * What clears it is a timer tick, not elapsed work: measured on this path,
+   * a 0.08ms gap between the change and the re-import is stale and a 1.14ms
+   * one is fresh, with every longer delay fresh too. But `setImmediate`
+   * (3/3) and a real `server.close()` on a live socket (5/5) are both still
+   * stale, so it is the kind of yield that matters, not the duration alone.
+   *
+   * The backend path is unaffected: its generator pass puts 21-34ms of real
+   * fs work between the two, well clear of the line.
    *
    * Unskip if the reload ever orders itself after Vite's invalidation.
    * */
