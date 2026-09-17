@@ -1,5 +1,5 @@
 diff --git a/docs/sidecar/development.md b/docs/sidecar/development.md
-index 0b45b47a..555db902 100644
+index 0b45b47a..02faae3c 100644
 --- a/docs/sidecar/development.md
 +++ b/docs/sidecar/development.md
 @@ -1,11 +1,12 @@
@@ -24,7 +24,7 @@ index 0b45b47a..555db902 100644
  
 -On a change to anything the entry imports it calls `teardown()`,
 -then the close function `start()` returned, re-imports the module and calls `start()` again.
-+On a change to anything the entry imports, it:
++When the entry changes - or any file it imports - it:
 +
 +1. re-imports the entry
 +2. calls `teardown()` on the running service
@@ -884,10 +884,10 @@ index 00000000..f5f0362c
 +});
 diff --git a/test/integration/sidecar/serve.test.ts b/test/integration/sidecar/serve.test.ts
 new file mode 100644
-index 00000000..bc4d9e37
+index 00000000..9b64956e
 --- /dev/null
 +++ b/test/integration/sidecar/serve.test.ts
-@@ -0,0 +1,54 @@
+@@ -0,0 +1,67 @@
 +import { afterAll, beforeAll, describe, expect, test } from "vitest";
 +
 +import { setupSidecarProject } from ".";
@@ -931,6 +931,19 @@ index 00000000..bc4d9e37
 +    // has invalidated the graph - a raw watcher listener re-imports first and
 +    // brings the service back up on the source as it was before the save
 +    expect(log[3]).toEqual("start:2");
++  });
++
++  test("editing the entry itself restarts it too", async () => {
++    // the entry is a module in the graph like any other - the trigger is not
++    // only the files it imports
++    await project.writeSource(
++      "entry.ts",
++      `${project.serviceEntry()}\n// touched\n`,
++    );
++
++    const log = await project.waitForLog(7);
++
++    expect(log.slice(4)).toEqual(["teardown:2", "close:2", "start:2"]);
 +  });
 +
 +  test("a file outside the graph does not restart it", async () => {

@@ -57,15 +57,16 @@ the new instance binds.
 
 ## Suites
 
-`integration:sidecar` - 17 tests, four CLI-scaffolded projects.
+`integration:sidecar` - 18 tests, four CLI-scaffolded projects.
 
 - `build.test.ts` (5) builds a sidecar folder beside an HTTP folder: output shape
   under `dist/<folder>/sidecar/`, the runner starting the service and staying up,
   `SIGINT` draining it through `teardown` then the close function, `dist/run.js`
   skipping a folder with no `kosmo.json`, and `run` omitted emitting the entry alone.
-- `serve.test.ts` (4) chassis in-process with `serve: true`: start on boot, restart
-  in the documented order, **the restarted service running the edited source**, and
-  no restart for a file outside the graph.
+- `serve.test.ts` (5) chassis in-process with `serve: true`: start on boot, restart
+  in the documented order, **the restarted service running the edited source**,
+  a restart when the entry itself is edited, and no restart for a file outside
+  the graph.
 - `reload-failure.test.ts` (4) a service holding a socket, driven through both
   failure modes in order: a save that cannot compile leaves it untouched and the
   next good save reloads it; then a `start()` that throws leaves nothing running,
@@ -93,7 +94,7 @@ Two things about how these are written:
 ## Verification
 
 ```
-integration:sidecar        17 passed   (3/3 runs, no stderr)
+integration:sidecar        18 passed   (3/3 runs, no stderr)
 integration:cli + backend  503 passed | 46 skipped
 unit                       819 passed | 1 skipped
 ```
@@ -107,5 +108,5 @@ Guard-checked, each reverted and confirmed red:
 - `run` input dropped from the sidecar build -> 3 of 5 `build.test.ts` tests fail
 
 One thing the suite does not cover: the `this.environment.name === "sidecar"` check
-in the hook. Removing it keeps all 17 green, because nothing but that environment
+in the hook. Removing it keeps all 18 green, because nothing but that environment
 resolves a module on this server today. Kept as a guard, not because anything trips it.

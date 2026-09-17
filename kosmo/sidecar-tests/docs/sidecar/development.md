@@ -15,7 +15,7 @@ Whether it does is the `serve` key.
 Without `serve`, a sidecar is built and left alone - it is a build artifact like any other, and starting it is yours.
 With `serve: true`, `kosmo serve` imports the entry into its own Vite environment and calls `start()`.
 
-On a change to anything the entry imports, it:
+When the entry changes - or any file it imports - it:
 
 1. re-imports the entry
 2. calls `teardown()` on the running service

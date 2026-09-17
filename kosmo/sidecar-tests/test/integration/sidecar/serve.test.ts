@@ -43,6 +43,19 @@ describe("sidecar under kosmo serve", () => {
     expect(log[3]).toEqual("start:2");
   });
 
+  test("editing the entry itself restarts it too", async () => {
+    // the entry is a module in the graph like any other - the trigger is not
+    // only the files it imports
+    await project.writeSource(
+      "entry.ts",
+      `${project.serviceEntry()}\n// touched\n`,
+    );
+
+    const log = await project.waitForLog(7);
+
+    expect(log.slice(4)).toEqual(["teardown:2", "close:2", "start:2"]);
+  });
+
   test("a file outside the graph does not restart it", async () => {
     const before = await project.readLog();
 
