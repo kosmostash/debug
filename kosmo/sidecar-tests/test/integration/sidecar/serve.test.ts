@@ -4,7 +4,7 @@ import { setupSidecarProject } from ".";
 
 const project = await setupSidecarProject({
   name: "worker",
-  sidecar: { entry: "./entry.ts", run: "./run.ts", serve: true },
+  sidecarFolder: { entry: "./entry.ts", run: "./run.ts", serve: true },
 });
 
 beforeAll(async () => {

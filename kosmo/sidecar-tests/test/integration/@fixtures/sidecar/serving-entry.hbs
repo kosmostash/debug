@@ -1,0 +1,31 @@
+import { appendFileSync } from "node:fs";
+import { createServer } from "node:http";
+
+import { defineService } from "_/sidecar";
+
+import { tick } from "./tick";
+
+const log = (event: string) => {
+  appendFileSync({{logFile}}, `${event}:${tick}\n`);
+};
+
+export default defineService({
+  async start() {
+{{#if failStartOn}}
+    if (tick === {{failStartOn}}) {
+      throw new Error("start failed");
+    }
+{{/if}}
+    const server = createServer((_req, res) => res.end(tick));
+    await new Promise<void>((resolve) => {
+      server.listen(0, () => resolve());
+    });
+    log("start");
+    return async () => {
+      await new Promise<void>((resolve, reject) => {
+        server.close((error) => (error ? reject(error) : resolve()));
+      });
+      log("close");
+    };
+  },
+});

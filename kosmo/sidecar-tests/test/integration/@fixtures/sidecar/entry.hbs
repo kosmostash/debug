@@ -1,0 +1,23 @@
+import { appendFileSync } from "node:fs";
+
+import { defineService } from "_/sidecar";
+
+import { tick } from "./tick";
+
+const log = (event: string) => {
+  appendFileSync({{logFile}}, `${event}:${tick}\n`);
+};
+
+export default defineService({
+  async start() {
+    const timer = setInterval(() => {}, 1000);
+    log("start");
+    return async () => {
+      clearInterval(timer);
+      log("close");
+    };
+  },
+  async teardown() {
+    log("teardown");
+  },
+});

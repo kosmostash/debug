@@ -10,7 +10,7 @@ import { setupSidecarProject } from ".";
  * */
 const project = await setupSidecarProject({
   name: "worker",
-  sidecar: {
+  sidecarFolder: {
     entry: "./entry.mjs",
     run: "./run.mjs",
     serve: true,

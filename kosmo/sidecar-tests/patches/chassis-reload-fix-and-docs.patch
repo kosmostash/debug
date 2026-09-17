@@ -1,0 +1,209 @@
+diff --git a/docs/sidecar/development.md b/docs/sidecar/development.md
+index 0b45b47a..02faae3c 100644
+--- a/docs/sidecar/development.md
++++ b/docs/sidecar/development.md
+@@ -1,11 +1,12 @@
+ ---
+ title: Sidecars in development
+-description: Running a sidecar under kosmo serve - how the reload works,
+-    and why the close function is what frees the port.
++description: Running a sidecar under kosmo serve - how the reload works, why the close
++    function is what frees the port, and when not to set serve at all.
+ head:
+   - - meta
+     - name: keywords
+-      content: sidecar serve, dev server, reload, EADDRINUSE, vite environment, hot reload
++      content: sidecar serve, dev server, reload, EADDRINUSE, vite environment, hot reload,
++        build-only sidecar, close function
+ ---
+ 
+ In dev mode, `kosmo serve` can run a sidecar alongside your app, so a worker is up while you work on the routes that feed it.
+@@ -14,8 +15,15 @@ Whether it does is the `serve` key.
+ Without `serve`, a sidecar is built and left alone - it is a build artifact like any other, and starting it is yours.
+ With `serve: true`, `kosmo serve` imports the entry into its own Vite environment and calls `start()`.
+ 
+-On a change to anything the entry imports it calls `teardown()`,
+-then the close function `start()` returned, re-imports the module and calls `start()` again.
++When the entry changes - or any file it imports - it:
++
++1. re-imports the entry
++2. calls `teardown()` on the running service
++3. calls the close function that service's `start()` returned
++4. calls `start()` on what it just imported
++
++The import comes first so that a save that cannot compile changes nothing:
++it throws at step 1, and the service keeps running.
+ 
+ It is one process, so there is no signal to catch and nothing to wait for on exit -
+ but that also means the close function is the only thing that frees a port.
+@@ -23,7 +31,7 @@ but that also means the close function is the only thing that frees a port.
+ Return one that actually closes the server,
+ or the next reload hits `EADDRINUSE` and keeps hitting it until you restart the dev server.
+ 
+-A reload that throws is reported and the dev server stays up; the next good save retries.
++A reload that throws is reported, the dev server stays up, and the next good save retries.
+ 
+ ::: warning Development only
+ `kosmo preview` and `dist/run.js` build sidecars but never start them.
+@@ -32,6 +40,35 @@ A reload that throws is reported and the dev server stays up; the next good save
+ 
+ ---
+ 
++### When not to set it
++
++`serve` earns its keep when the service holds something open between edits -
++a socket bound, a consumer subscribed, a pool connected.
++That is what makes a restart worth doing, and the close function is what releases it.
++
++A sidecar whose `start()` holds nothing has none of that.
++There is no socket to rebind, nothing for the reload to free,
++and no state that being up between saves preserves -
++the dev server is only re-running a function that returns.
++
++Leave `serve` off and let it be a build artifact:
++
++```ts [src/mailer/kosmo.config.ts]
++export default defineConfig({
++  sidecar: {
++    entry: "./entry.ts",
++    run: "./run.ts",
++    // nothing to keep alive between edits - build it, start it yourself
++    serve: false,
++  },
++});
++```
++
++An empty close function is the tell.
++If there is nothing to put in it, there is nothing `serve: true` is keeping alive for you.
++
++---
++
+ ### Typechecking
+ 
+ Nothing to configure. A sidecar lives inside a source folder,
+diff --git a/packages/dev/src/chassis.ts b/packages/dev/src/chassis.ts
+index 317a5c24..cd3afc86 100644
+--- a/packages/dev/src/chassis.ts
++++ b/packages/dev/src/chassis.ts
+@@ -4,7 +4,12 @@ import { join, posix, resolve } from "node:path";
+ import { styleText } from "node:util";
+ 
+ import { pathToRegexp } from "path-to-regexp";
+-import { build, createServer, type RunnableDevEnvironment } from "vite";
++import {
++  build,
++  createServer,
++  type Plugin,
++  type RunnableDevEnvironment,
++} from "vite";
+ 
+ import {
+   defaults,
+@@ -242,6 +247,37 @@ export default async (
+     }
+ 
+     if (sidecar?.serve) {
++      /**
++       * Assigned once the service is up; the reload plugin below is installed
++       * during `createServer`, so the hook has to reach it through a binding
++       * rather than a closure over something that does not exist yet.
++       * */
++      let reload = async () => {};
++
++      /**
++       * Restarting on a raw `watcher.on("change")` reads the module graph
++       * before Vite has invalidated it, and the service comes back up running
++       * the source as it was before the save.
++       *
++       * `hotUpdate` is called after that invalidation, so ordering is a
++       * property of where the hook sits rather than of how long anything
++       * happens to take. Returning `[]` says the update is handled and
++       * leaves Vite nothing to propagate.
++       *
++       * The hook runs once per environment; nothing but `sidecar` resolves a
++       * module on this server today, so the name check is there to keep it
++       * that way rather than because anything currently trips it.
++       * */
++      const reloadPlugin: Plugin = {
++        name: "kosmo:sidecar-reload",
++        hotUpdate({ modules }) {
++          if (this.environment.name === "sidecar" && modules.length) {
++            void reload();
++          }
++          return [];
++        },
++      };
++
+       const viteServer = await createServer(
+         mergeConfigs(
+           // user-provided config - lowest priority
+@@ -251,8 +287,13 @@ export default async (
+             root: createPath.src(),
+             appType: "custom",
+             cacheDir: cacheDir(sourceFolder, command, "sidecar"),
+-            plugins,
+-            server: { hmr: false },
++            plugins: [...plugins, reloadPlugin],
++            /**
++             * `hotUpdate` is part of the HMR pipeline, so it runs only with
++             * `hmr` on - but this server is never listened on, so no socket
++             * is ever bound and no port is taken.
++             * */
++            server: { hmr: true },
+             resolve: {
+               conditions: ["node"],
+             },
+@@ -279,23 +320,37 @@ export default async (
+       let service = await loadService();
+       let close = await service.start();
+ 
+-      viteServer.watcher.on("change", async (file) => {
+-        const mods = env.moduleGraph.getModulesByFile(file);
+-        if (mods?.size) {
+-          try {
+-            await service.teardown?.();
+-            await close();
+-            service = await loadService();
+-            close = await service.start();
+-          } catch (error) {
+-            // keep the dev server alive; the next good save reloads
+-            console.error(
+-              styleText("red", `${sourceFolder.name}: sidecar reload failed`),
+-            );
+-            console.error(error);
+-          }
++      reload = async () => {
++        try {
++          /**
++           * Load before tearing anything down: a save that cannot compile
++           * throws here, and the running service is left untouched rather
++           * than closed with nothing to replace it - which is unrecoverable
++           * for a service whose close function cannot run twice.
++           *
++           * Starting still happens after closing, so a service holding a
++           * port frees it before the new one binds.
++           * */
++          const next = await loadService();
++          await service.teardown?.();
++          await close();
++          /**
++           * Nothing is running between here and `start()`, so drop the closer:
++           * a `start()` that throws would otherwise leave the next reload
++           * calling it a second time, which for a real one throws too - and
++           * the sidecar never comes back.
++           * */
++          close = async () => {};
++          service = next;
++          close = await service.start();
++        } catch (error) {
++          // keep the dev server alive; the next good save reloads
++          console.error(
++            styleText("red", `${sourceFolder.name}: sidecar reload failed`),
++          );
++          console.error(error);
+         }
+-      });
++      };
+ 
+       teardownHandlers.push(viteServer.close);
+     }

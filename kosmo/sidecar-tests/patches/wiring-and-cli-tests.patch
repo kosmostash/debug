@@ -1,0 +1,157 @@
+diff --git a/package.json b/package.json
+index f4670548..b50ef8ad 100644
+--- a/package.json
++++ b/package.json
+@@ -17,6 +17,7 @@
+     "test:unit:packages": "vitest run --project=packages/*",
+     "test:integration": "vitest run --project=\"integration:*\"",
+     "test:integration:cli": "vitest run --project=integration:cli",
++    "test:integration:sidecar": "vitest run --project=integration:sidecar",
+     "test:integration:backend": "vitest run --project=integration:backend",
+     "test:integration:csr": "vitest run --project=integration:csr",
+     "test:integration:ssr": "vitest run --project=integration:ssr",
+diff --git a/test/integration/cli/folders.test.ts b/test/integration/cli/folders.test.ts
+index cbbca4ef..4cd53c69 100644
+--- a/test/integration/cli/folders.test.ts
++++ b/test/integration/cli/folders.test.ts
+@@ -1,4 +1,4 @@
+-import { mkdir, readdir, rm } from "node:fs/promises";
++import { mkdir, readdir, readFile, rm } from "node:fs/promises";
+ import { join, resolve } from "node:path";
+ 
+ import { afterEach, describe, expect, test } from "vitest";
+@@ -219,3 +219,107 @@ describe("folder: flag matrix", async () => {
+     }
+   });
+ });
++
++describe("sidecar: scaffolding", async () => {
++  const createSidecar = async (args: Array<string>) => {
++    await mkdir(tempDir, { recursive: true });
++
++    const projectName = "test";
++    const projectRoot = resolve(tempDir, projectName);
++
++    // create host project
++    await run(
++      createBin,
++      [projectName, "--no-frontend", "--no-backend"],
++      tempDir,
++    );
++
++    const result = await run(kosmoBin, ["sidecar", ...args], projectRoot);
++
++    const folderPath = resolve(projectRoot, join(defaults.srcDir, args[0] || ""));
++
++    return {
++      entries: await readdir(folderPath).catch(() => []),
++      config: await readFile(resolve(folderPath, "kosmo.config.ts"), "utf8") //
++        .catch(() => ""),
++      ...result,
++    };
++  };
++
++  test("seeds the entry, the runner and a folder tsconfig", async () => {
++    const { code, entries } = await createSidecar(["mailer"]);
++
++    expect(code).toEqual(0);
++    expect(entries.sort()).toEqual([
++      "entry.ts",
++      "kosmo.config.ts",
++      "run.ts",
++      "tsconfig.json",
++    ]);
++  });
++
++  test("seeds no route folders - a sidecar serves nothing", async () => {
++    const { code, entries } = await createSidecar(["mailer"]);
++
++    expect(code).toEqual(0);
++    expect(entries).not.toContain("api");
++    expect(entries).not.toContain("pages");
++  });
++
++  test("writes a sidecar block pointing at both seeded files", async () => {
++    const { code, config } = await createSidecar(["mailer"]);
++
++    expect(code).toEqual(0);
++    expect(config).toMatch(/sidecar:\s*\{/);
++    expect(config).toMatch(/entry:\s*"\.\/entry\.ts"/);
++    expect(config).toMatch(/run:\s*"\.\/run\.ts"/);
++    // off by default: starting it under the dev server is opt-in
++    expect(config).toMatch(/serve:\s*false/);
++  });
++
++  test("declares neither frontend nor backend", async () => {
++    const { code, config } = await createSidecar(["mailer"]);
++
++    expect(code).toEqual(0);
++    expect(config).not.toMatch(/frontend:/);
++    expect(config).not.toMatch(/backend:/);
++  });
++
++  test("missing name fails", async () => {
++    const { code, stderr } = await createSidecar([]);
++
++    expect(code).not.toEqual(0);
++    expect(stderr).toMatch(/No sidecar name provided/);
++  });
++
++  test("existing dir fails", async () => {
++    const { code } = await createSidecar(["mailer"]);
++
++    expect(code).toEqual(0);
++
++    {
++      const { code, stderr } = await createSidecar(["mailer"]);
++      expect(code).not.toEqual(0);
++      expect(stderr).toMatch(/already exists/);
++    }
++  });
++
++  test("existing dir succeeds with --overwrite", async () => {
++    const { code } = await createSidecar(["mailer"]);
++
++    expect(code).toEqual(0);
++
++    {
++      const { code } = await createSidecar(["mailer", "--overwrite"]);
++      expect(code).toEqual(0);
++    }
++  });
++
++  test("unknown option fails with a clean error, not a stack trace", async () => {
++    const { code, stderr } = await createSidecar(["mailer", "--unknown-option"]);
++
++    expect(code).not.toEqual(0);
++    expect(stderr).toMatch("Unknown option '--unknown-option'");
++    expect(stderr).not.toMatch(/ERR_PARSE_ARGS_UNKNOWN_OPTION/);
++  });
++});
+diff --git a/test/package.json b/test/package.json
+index 0d157a0e..61cd9cdd 100644
+--- a/test/package.json
++++ b/test/package.json
+@@ -9,6 +9,7 @@
+     "test:unit:packages": "pnpm -C .. run test:unit:packages",
+     "test:integration": "pnpm -C .. run test:integration",
+     "test:integration:cli": "pnpm -C .. run test:integration:cli",
++    "test:integration:sidecar": "pnpm -C .. run test:integration:sidecar",
+     "test:integration:backend": "pnpm -C .. run test:integration:backend",
+     "test:integration:csr": "pnpm -C .. run test:integration:csr",
+     "test:integration:ssr": "pnpm -C .. run test:integration:ssr",
+diff --git a/vitest.config.js b/vitest.config.js
+index e2492a5a..c8b963ab 100644
+--- a/vitest.config.js
++++ b/vitest.config.js
+@@ -92,6 +92,10 @@ export default defineConfig({
+         include: ["integration/cli/*.test.ts"],
+       }),
+ 
++      setupFactory("integration:sidecar", {
++        include: ["integration/sidecar/*.test.ts"],
++      }),
++
+       setupFactory("integration:backend", {
+         include: ["integration/{hono,h3,koa}/*.test.ts"],
+         provide: {

@@ -1,18 +1,52 @@
 # Sidecar reload fix + integration tests
 
-Against `kosmojs/kosmo@4cd87b4f` ("feat(sidecar): a source folder that builds a standalone process").
+Baseline `kosmojs/kosmo@4cd87b4f`, with the suite adapted to your local refactor.
 
-## Contents
+## What applies where
+
+The patches are self-contained against `4cd87b4f` (both `git apply --check` clean):
 
 ```
-patches/sidecar-reload-tests-and-docs.patch   apply to a clean 4cd87b4f
-packages/dev/src/chassis.ts                   the changed file, whole
-test/integration/sidecar/                     the new suite
-test/integration/cli/folders.test.ts          with the sidecar section appended
-docs/sidecar/development.md                   with the reload sequence corrected
+patches/chassis-reload-fix-and-docs.patch   packages/dev/src/chassis.ts + docs/sidecar/development.md
+patches/wiring-and-cli-tests.patch          vitest project, scripts, cli/folders.test.ts sidecar section
 ```
 
-Verified with `git apply --check` against a pristine `4cd87b4f`.
+**The sidecar suite is shipped as files, not as a patch**, because it now targets
+your refactored tree rather than `4cd87b4f`: it imports `buildProject`, `env`,
+`execFile`, `findFreePort`, `installDependencies` and `pkgsDir` from
+`test/integration`, and `createHTTPFolder` from `@kosmojs/cli`.
+
+```
+test/integration/@fixtures/sidecar/     the service fixtures
+test/integration/sidecar/               the harness and the four test files
+```
+
+The four test files needed one change for the refactor: `sidecar:` -> `sidecarFolder:`
+and `webFolder:` -> `httpFolder:` in each `setupSidecarProject` call. Nothing else.
+
+## Fixtures
+
+Following the `@fixtures/*/templates` convention - `.hbs` sources, an `index.ts`
+re-exporting them with `?raw`:
+
+```
+@fixtures/sidecar/
+├── index.ts
+├── entry.hbs             defineService, a timer, logs every lifecycle call
+├── serving-entry.hbs     the same holding a socket; {{#if failStartOn}} makes start() throw
+├── tick.hbs              the dependency a test edits to provoke a reload
+└── mjs/
+    ├── entry.hbs         plain ESM - no defineService, no types
+    └── run.hbs           its runner, the shape `kosmo sidecar` seeds
+```
+
+`render` from `@kosmojs/lib` defaults to `noEscape: true`. `logFile` and the tick
+`value` arrive JSON-serialized, so a path or a value lands as a valid literal
+whatever it carries - which is why they appear unquoted in the templates.
+
+Rendered output was checked by eye under `KEEP_PROJECT=1`, including the
+`failStartOn` branch: handlebars strips the standalone block lines, so indentation
+comes out as written.
 
 ## Two fixes in `chassis.ts`
 
@@ -34,8 +68,6 @@ sidecar and left it closed - and because a real close function cannot run twice
 (`server.close()` on a closed server throws), *every* later save failed in `close()`
 too. The sidecar stayed dead until the dev server was restarted.
 
-The fix is ordering plus one reset:
-
 ```ts
 const next = await loadService();   // throws on a bad save - nothing has changed yet
 await service.teardown?.();
@@ -44,8 +76,6 @@ close = async () => {};             // nothing is running now
 service = next;
 close = await service.start();      // throws -> no stale closer left behind
 ```
-
-Two failure modes, both now recoverable:
 
 | failure | before | after |
 |---|---|---|
@@ -64,22 +94,20 @@ the new instance binds.
   `SIGINT` draining it through `teardown` then the close function, `dist/run.js`
   skipping a folder with no `kosmo.json`, and `run` omitted emitting the entry alone.
 - `serve.test.ts` (5) chassis in-process with `serve: true`: start on boot, restart
-  in the documented order, **the restarted service running the edited source**,
-  a restart when the entry itself is edited, and no restart for a file outside
-  the graph.
+  in the documented order, **the restarted service running the edited source**, a
+  restart when the entry itself is edited, and no restart for a file outside the graph.
 - `reload-failure.test.ts` (4) a service holding a socket, driven through both
   failure modes in order: a save that cannot compile leaves it untouched and the
   next good save reloads it; then a `start()` that throws leaves nothing running,
   and the next good save still reloads it.
 - `mjs-entry.test.ts` (4) a plain-JavaScript sidecar - `entry.mjs`, `run.mjs`, no
   `defineService`, `typecheck: false`: the dev server starts it, reloads it on a
-  change to what it imports, `kosmo typecheck` skips the folder rather than
-  checking it, and it builds to the same place a TypeScript one does.
+  change to what it imports, `kosmo typecheck` skips the folder, and it builds to
+  the same place a TypeScript one does.
 
-`integration:cli` - 8 added tests covering `kosmo sidecar <name>`: what it seeds,
-that it seeds no route folders, the config block it writes, and the error paths.
+`integration:cli` - 8 added tests covering `kosmo sidecar <name>`.
 
-Two things about how these are written:
+Two notes on how these are written:
 
 - The service logs lifecycle calls to a file rather than a variable: under
   `kosmo serve` the entry is evaluated inside Vite's module runner and every reload
@@ -87,14 +115,14 @@ Two things about how these are written:
   instance agree on.
 - `reload-failure.test.ts` captures `console.error` and asserts on it. Both cases
   make chassis report a failed reload, and a suite that prints expected stack traces
-  buries the unexpected ones. The report is behaviour worth asserting anyway.
+  buries the unexpected ones.
 - The typecheck case asserts exit codes, not the printed `SKIP`: `spinnerFactory`
   stubs itself out when stdout is not a TTY, so nothing is printed under vitest.
 
 ## Verification
 
 ```
-integration:sidecar        18 passed   (3/3 runs, no stderr)
+integration:sidecar        18 passed   (no stderr)
 integration:cli + backend  503 passed | 46 skipped
 unit                       819 passed | 1 skipped
 ```

@@ -8,8 +8,8 @@ import { setupSidecarProject } from ".";
  * */
 const project = await setupSidecarProject({
   name: "worker",
-  sidecar: { entry: "./entry.ts", run: "./run.ts" },
-  webFolder: { name: "web", base: "/api" },
+  sidecarFolder: { entry: "./entry.ts", run: "./run.ts" },
+  httpFolder: { name: "web", base: "/api" },
 });
 
 beforeAll(async () => {

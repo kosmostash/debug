@@ -3,18 +3,24 @@ import { mkdir, mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, resolve } from "node:path";
 
+import { createProject } from "create-kosmo";
 import { createJiti } from "jiti";
 
-import { createSidecarFolder, createSourceFolder } from "@kosmojs/cli";
+import { createHTTPFolder, createSidecarFolder } from "@kosmojs/cli";
 import type { ProjectSettings, SourceFolder } from "@kosmojs/core";
 import chassis from "@kosmojs/dev/chassis";
-import { pathResolver } from "@kosmojs/lib";
-import { createProject } from "create-kosmo";
+import { pathResolver, render } from "@kosmojs/lib";
 
-import { env, exec, execFile } from "..";
-import { findFreePort } from "../setup";
+import * as templates from "../@fixtures/sidecar";
 
-const pnpmDir = resolve(tmpdir(), ".kosmojs/pnpm-store");
+import {
+  buildProject,
+  env,
+  execFile,
+  findFreePort,
+  installDependencies,
+  pkgsDir,
+} from "..";
 
 type SidecarConfig = {
   entry?: string;
@@ -32,13 +38,13 @@ type SidecarConfig = {
  * */
 export const setupSidecarProject = async ({
   name = "worker",
-  sidecar = {},
-  webFolder,
+  sidecarFolder = {},
+  httpFolder,
 }: {
   name?: string;
-  sidecar?: SidecarConfig;
+  sidecarFolder?: SidecarConfig;
   // a second, HTTP-serving folder - the layout the docs recommend
-  webFolder?: { name: string; base: string };
+  httpFolder?: { name: string; base: string };
 } = {}) => {
   const devPort = await findFreePort();
   const tempDir = await mkdtemp(resolve(tmpdir(), ".kosmojs-sidecar-"));
@@ -59,12 +65,15 @@ export const setupSidecarProject = async ({
   const children = new Set<child_process.ChildProcess>();
 
   /**
-   * The service logs to a file rather than to a variable: under `kosmo serve`
-   * the entry is evaluated inside Vite's module runner, and every reload
-   * produces a fresh module instance. A file is the one channel the test and
-   * every instance of the service agree on.
+   * The service logs to a file rather than to a variable:
+   * under `kosmo serve` the entry is evaluated inside Vite's module runner,
+   * and every reload produces a fresh module instance.
+   * A file is the one channel the test and every instance of the service agree on.
    * */
   const logFile = resolve(tempDir, "service.log");
+
+  // the templates place it as a literal, so it survives any path
+  const logFileLiteral = JSON.stringify(logFile);
 
   const writeFile_ = async (path: string, content: string) => {
     await mkdir(dirname(path), { recursive: true });
@@ -78,8 +87,6 @@ export const setupSidecarProject = async ({
     createPath,
 
     async bootstrap() {
-      const pkgsDir = resolve(import.meta.dirname, "../../../packages");
-
       await createProject(
         projectRoot,
         { name: "app", devPort },
@@ -92,48 +99,40 @@ export const setupSidecarProject = async ({
         },
       );
 
-      if (webFolder) {
-        await createSourceFolder(
+      if (httpFolder) {
+        await createHTTPFolder(
           projectRoot,
-          { name: webFolder.name, backend: "hono" },
-          { backend: { base: webFolder.base } },
+          { name: httpFolder.name, backend: "hono" },
+          { backend: { base: httpFolder.base } },
         );
       }
 
       await createSidecarFolder(projectRoot, { name, sidecar: true });
 
       // the seeded config is the default one; tests state what they need
-      await this.writeConfig(sidecar);
+      await this.writeConfig(sidecarFolder);
 
-      await exec(
-        "pnpm",
-        [
-          "install",
-          "--store-dir",
-          pnpmDir,
-          "--no-frozen-lockfile",
-          "--prefer-offline",
-        ],
-        { cwd: projectRoot, env },
-      );
+      await installDependencies(projectRoot);
     },
 
     /** Rewrite the folder's kosmo.config.ts - `run: undefined` drops the key. */
-    async writeConfig({ entry = "./entry.ts", run, serve, typecheck }: SidecarConfig) {
+    async writeConfig({
+      entry = "./entry.ts",
+      run,
+      serve,
+      typecheck,
+    }: SidecarConfig) {
       await writeFile_(
         createPath.src("kosmo.config.ts"),
         [
           `import { defineConfig } from "@kosmojs/dev";`,
-          ``,
           `export default defineConfig({`,
           `  sidecar: {`,
           `    entry: ${JSON.stringify(entry)},`,
           ...(run === undefined ? [] : [`    run: ${JSON.stringify(run)},`]),
           ...(serve === undefined ? [] : [`    serve: ${serve},`]),
           `  },`,
-          ...(typecheck === undefined
-            ? []
-            : [`  typecheck: ${typecheck},`]),
+          ...(typecheck === undefined ? [] : [`  typecheck: ${typecheck},`]),
           `});`,
           ``,
         ].join("\n"),
@@ -152,32 +151,7 @@ export const setupSidecarProject = async ({
      * and see whether the reloaded service picked the new source up.
      * */
     serviceEntry() {
-      return [
-        `import { appendFileSync } from "node:fs";`,
-        ``,
-        `import { defineService } from "_/sidecar";`,
-        ``,
-        `import { tick } from "./tick";`,
-        ``,
-        `const log = (event: string) => {`,
-        `  appendFileSync(${JSON.stringify(logFile)}, \`\${event}:\${tick}\\n\`);`,
-        `};`,
-        ``,
-        `export default defineService({`,
-        `  async start() {`,
-        `    const timer = setInterval(() => {}, 1000);`,
-        `    log("start");`,
-        `    return async () => {`,
-        `      clearInterval(timer);`,
-        `      log("close");`,
-        `    };`,
-        `  },`,
-        `  async teardown() {`,
-        `    log("teardown");`,
-        `  },`,
-        `});`,
-        ``,
-      ].join("\n");
+      return render(templates.entry, { logFile: logFileLiteral });
     },
 
     /**
@@ -190,42 +164,12 @@ export const setupSidecarProject = async ({
      * provoke the other way a reload fails.
      * */
     servingEntry({ failStartOn }: { failStartOn?: string } = {}) {
-      return [
-        `import { appendFileSync } from "node:fs";`,
-        `import { createServer } from "node:http";`,
-        ``,
-        `import { defineService } from "_/sidecar";`,
-        ``,
-        `import { tick } from "./tick";`,
-        ``,
-        `const log = (event: string) => {`,
-        `  appendFileSync(${JSON.stringify(logFile)}, \`\${event}:\${tick}\\n\`);`,
-        `};`,
-        ``,
-        `export default defineService({`,
-        `  async start() {`,
-        ...(failStartOn
-          ? [
-              `    if (tick === ${JSON.stringify(failStartOn)}) {`,
-              `      throw new Error("start failed");`,
-              `    }`,
-            ]
-          : []),
-        `    const server = createServer((_req, res) => res.end(tick));`,
-        `    await new Promise<void>((resolve) => {`,
-        `      server.listen(0, () => resolve());`,
-        `    });`,
-        `    log("start");`,
-        `    return async () => {`,
-        `      await new Promise<void>((resolve, reject) => {`,
-        `        server.close((error) => (error ? reject(error) : resolve()));`,
-        `      });`,
-        `      log("close");`,
-        `    };`,
-        `  },`,
-        `});`,
-        ``,
-      ].join("\n");
+      return render(templates.servingEntry, {
+        logFile: logFileLiteral,
+        ...(failStartOn === undefined
+          ? {}
+          : { failStartOn: JSON.stringify(failStartOn) }),
+      });
     },
 
     /**
@@ -234,48 +178,16 @@ export const setupSidecarProject = async ({
      * JavaScript looks like, and what `typecheck: false` is for.
      * */
     mjsEntry() {
-      return [
-        `import { appendFileSync } from "node:fs";`,
-        ``,
-        `import { tick } from "./tick.mjs";`,
-        ``,
-        `const log = (event) => {`,
-        `  appendFileSync(${JSON.stringify(logFile)}, \`\${event}:\${tick}\\n\`);`,
-        `};`,
-        ``,
-        `export default {`,
-        `  async start() {`,
-        `    const timer = setInterval(() => {}, 1000);`,
-        `    log("start");`,
-        `    return async () => {`,
-        `      clearInterval(timer);`,
-        `      log("close");`,
-        `    };`,
-        `  },`,
-        `};`,
-        ``,
-      ].join("\n");
+      return render(templates.mjsEntry, { logFile: logFileLiteral });
     },
 
+    /** Its runner, the same shape `kosmo sidecar` seeds. */
     mjsRunner() {
-      return [
-        `import service from "./entry.mjs";`,
-        ``,
-        `const close = await service.start();`,
-        ``,
-        `for (const signal of ["SIGINT", "SIGTERM"]) {`,
-        `  process.on(signal, async () => {`,
-        `    await service.teardown?.();`,
-        `    await close();`,
-        `    process.exit(0);`,
-        `  });`,
-        `}`,
-        ``,
-      ].join("\n");
+      return templates.mjsRunner;
     },
 
     tickModule(value: string) {
-      return `export const tick = ${JSON.stringify(value)};\n`;
+      return render(templates.tick, { value: JSON.stringify(value) });
     },
 
     /** Truncate the log so a test reads only what it provoked. */
@@ -301,21 +213,25 @@ export const setupSidecarProject = async ({
     },
 
     build() {
-      return exec("pnpm", ["build"], { cwd: projectRoot, env });
+      return buildProject(projectRoot);
     },
 
     /**
-     * The CLI itself, run against the project - the shared `exec` exits the
-     * whole process on a non-zero code, and a skipped typecheck is something
-     * a test wants to read rather than die on.
+     * The CLI itself, run against the project -
+     * the shared `exec` exits the whole process on a non-zero code,
+     * and a skipped typecheck is something a test wants to read rather than die on.
      * */
     async runKosmo(args: Array<string>) {
-      const bin = resolve(import.meta.dirname, "../../../packages/cli/pkg/cli.js");
+      const bin = resolve(pkgsDir, "cli/pkg/cli.js");
       try {
-        const { stdout, stderr } = await execFile(process.execPath, [bin, ...args], {
-          cwd: projectRoot,
-          env,
-        });
+        const { stdout, stderr } = await execFile(
+          process.execPath,
+          [bin, ...args],
+          {
+            cwd: projectRoot,
+            env,
+          },
+        );
         return { code: 0, stdout, stderr };
       } catch (error) {
         const { code, stdout, stderr } = error as {
@@ -331,7 +247,7 @@ export const setupSidecarProject = async ({
       }
     },
 
-    distEntries(...path: Array<string>) {
+    async distEntries(...path: Array<string>) {
       return readdir(createPath.distDir(...path)).catch(() => []);
     },
 
@@ -376,13 +292,13 @@ export const setupSidecarProject = async ({
         /** Resolves with how it ended, or "running" if it outlived the wait. */
         exit(timeout = 5000): Promise<string> {
           if (child.exitCode !== null || child.signalCode !== null) {
-            return Promise.resolve(`exit ${child.signalCode ?? child.exitCode}`);
+            return Promise.resolve(
+              `exit ${child.signalCode ?? child.exitCode}`,
+            );
           }
           return Promise.race([
             new Promise<string>((r) => {
-              child.once("exit", (code, signal) =>
-                r(`exit ${signal ?? code}`),
-              );
+              child.once("exit", (code, signal) => r(`exit ${signal ?? code}`));
             }),
             new Promise<string>((r) => setTimeout(() => r("running"), timeout)),
           ]);
