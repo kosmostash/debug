@@ -11,7 +11,7 @@ import chassis from "@kosmojs/dev/chassis";
 import { pathResolver } from "@kosmojs/lib";
 import { createProject } from "create-kosmo";
 
-import { env, exec } from "..";
+import { env, exec, execFile } from "..";
 import { findFreePort } from "../setup";
 
 const pnpmDir = resolve(tmpdir(), ".kosmojs/pnpm-store");
@@ -20,6 +20,7 @@ type SidecarConfig = {
   entry?: string;
   run?: string;
   serve?: boolean;
+  typecheck?: boolean;
 };
 
 /**
@@ -118,7 +119,7 @@ export const setupSidecarProject = async ({
     },
 
     /** Rewrite the folder's kosmo.config.ts - `run: undefined` drops the key. */
-    async writeConfig({ entry = "./entry.ts", run, serve }: SidecarConfig) {
+    async writeConfig({ entry = "./entry.ts", run, serve, typecheck }: SidecarConfig) {
       await writeFile_(
         createPath.src("kosmo.config.ts"),
         [
@@ -130,6 +131,9 @@ export const setupSidecarProject = async ({
           ...(run === undefined ? [] : [`    run: ${JSON.stringify(run)},`]),
           ...(serve === undefined ? [] : [`    serve: ${serve},`]),
           `  },`,
+          ...(typecheck === undefined
+            ? []
+            : [`  typecheck: ${typecheck},`]),
           `});`,
           ``,
         ].join("\n"),
@@ -224,6 +228,52 @@ export const setupSidecarProject = async ({
       ].join("\n");
     },
 
+    /**
+     * The same service as plain ESM - no `defineService`, no types, relative
+     * imports carrying their extension. What a sidecar wrapping third-party
+     * JavaScript looks like, and what `typecheck: false` is for.
+     * */
+    mjsEntry() {
+      return [
+        `import { appendFileSync } from "node:fs";`,
+        ``,
+        `import { tick } from "./tick.mjs";`,
+        ``,
+        `const log = (event) => {`,
+        `  appendFileSync(${JSON.stringify(logFile)}, \`\${event}:\${tick}\\n\`);`,
+        `};`,
+        ``,
+        `export default {`,
+        `  async start() {`,
+        `    const timer = setInterval(() => {}, 1000);`,
+        `    log("start");`,
+        `    return async () => {`,
+        `      clearInterval(timer);`,
+        `      log("close");`,
+        `    };`,
+        `  },`,
+        `};`,
+        ``,
+      ].join("\n");
+    },
+
+    mjsRunner() {
+      return [
+        `import service from "./entry.mjs";`,
+        ``,
+        `const close = await service.start();`,
+        ``,
+        `for (const signal of ["SIGINT", "SIGTERM"]) {`,
+        `  process.on(signal, async () => {`,
+        `    await service.teardown?.();`,
+        `    await close();`,
+        `    process.exit(0);`,
+        `  });`,
+        `}`,
+        ``,
+      ].join("\n");
+    },
+
     tickModule(value: string) {
       return `export const tick = ${JSON.stringify(value)};\n`;
     },
@@ -252,6 +302,33 @@ export const setupSidecarProject = async ({
 
     build() {
       return exec("pnpm", ["build"], { cwd: projectRoot, env });
+    },
+
+    /**
+     * The CLI itself, run against the project - the shared `exec` exits the
+     * whole process on a non-zero code, and a skipped typecheck is something
+     * a test wants to read rather than die on.
+     * */
+    async runKosmo(args: Array<string>) {
+      const bin = resolve(import.meta.dirname, "../../../packages/cli/pkg/cli.js");
+      try {
+        const { stdout, stderr } = await execFile(process.execPath, [bin, ...args], {
+          cwd: projectRoot,
+          env,
+        });
+        return { code: 0, stdout, stderr };
+      } catch (error) {
+        const { code, stdout, stderr } = error as {
+          code?: unknown;
+          stdout?: unknown;
+          stderr?: unknown;
+        };
+        return {
+          code: typeof code === "number" ? code : 1,
+          stdout: String(stdout || ""),
+          stderr: String(stderr || ""),
+        };
+      }
     },
 
     distEntries(...path: Array<string>) {

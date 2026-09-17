@@ -1,4 +1,4 @@
-import { afterAll, beforeAll, describe, expect, test } from "vitest";
+import { afterAll, beforeAll, describe, expect, test, vi } from "vitest";
 
 import { setupSidecarProject } from ".";
 
@@ -15,7 +15,20 @@ const project = await setupSidecarProject({
   sidecar: { entry: "./entry.ts", run: "./run.ts", serve: true },
 });
 
+/**
+ * Both cases below make chassis report a failed reload on `console.error`.
+ * Captured rather than left to print: the report is behaviour worth asserting,
+ * and a suite that logs expected stack traces buries the unexpected ones.
+ * */
+const reported: Array<string> = [];
+
+const takeReported = () => reported.splice(0).join("\n");
+
 beforeAll(async () => {
+  vi.spyOn(console, "error").mockImplementation((...args: Array<unknown>) => {
+    reported.push(args.map((arg) => String(arg)).join(" "));
+  });
+
   await project.bootstrap();
   await project.writeSource("tick.ts", project.tickModule("1"));
   await project.writeSource(
@@ -28,17 +41,24 @@ beforeAll(async () => {
 
 afterAll(async () => {
   await project.teardown();
+  vi.restoreAllMocks();
 });
 
 const settle = () => new Promise((resolve) => setTimeout(resolve, 2000));
 
 describe("a save that cannot compile", () => {
-  test("leaves the running service untouched", async () => {
+  test("leaves the running service untouched, and says so", async () => {
+    takeReported();
+
     await project.writeSource("tick.ts", "export const tick = ;\n");
     await settle();
 
     // the import is what throws, and it runs before anything is torn down
     expect(await project.readLog()).toEqual(["start:1"]);
+
+    const errors = takeReported();
+    expect(errors).toMatch(/worker: sidecar reload failed/);
+    expect(errors).toMatch(/tick\.ts/);
   });
 
   test("the next good save reloads it", async () => {
@@ -46,6 +66,7 @@ describe("a save that cannot compile", () => {
     await settle();
 
     expect(await project.readLog()).toEqual(["start:1", "close:1", "start:2"]);
+    expect(takeReported()).toEqual("");
   });
 });
 
@@ -61,6 +82,10 @@ describe("a start() that throws", () => {
       "start:2",
       "close:2",
     ]);
+
+    const errors = takeReported();
+    expect(errors).toMatch(/worker: sidecar reload failed/);
+    expect(errors).toMatch(/start failed/);
   });
 
   test("the next good save still reloads it", async () => {
@@ -76,5 +101,6 @@ describe("a start() that throws", () => {
       "close:2",
       "start:3",
     ]);
+    expect(takeReported()).toEqual("");
   });
 });

@@ -57,7 +57,7 @@ the new instance binds.
 
 ## Suites
 
-`integration:sidecar` - 13 tests, three CLI-scaffolded projects.
+`integration:sidecar` - 17 tests, four CLI-scaffolded projects.
 
 - `build.test.ts` (5) builds a sidecar folder beside an HTTP folder: output shape
   under `dist/<folder>/sidecar/`, the runner starting the service and staying up,
@@ -70,18 +70,30 @@ the new instance binds.
   failure modes in order: a save that cannot compile leaves it untouched and the
   next good save reloads it; then a `start()` that throws leaves nothing running,
   and the next good save still reloads it.
+- `mjs-entry.test.ts` (4) a plain-JavaScript sidecar - `entry.mjs`, `run.mjs`, no
+  `defineService`, `typecheck: false`: the dev server starts it, reloads it on a
+  change to what it imports, `kosmo typecheck` skips the folder rather than
+  checking it, and it builds to the same place a TypeScript one does.
 
 `integration:cli` - 8 added tests covering `kosmo sidecar <name>`: what it seeds,
 that it seeds no route folders, the config block it writes, and the error paths.
 
-The service logs lifecycle calls to a file rather than a variable: under `kosmo serve`
-the entry is evaluated inside Vite's module runner and every reload produces a fresh
-module instance, so a file is the one channel the test and every instance agree on.
+Two things about how these are written:
+
+- The service logs lifecycle calls to a file rather than a variable: under
+  `kosmo serve` the entry is evaluated inside Vite's module runner and every reload
+  produces a fresh module instance, so a file is the one channel the test and every
+  instance agree on.
+- `reload-failure.test.ts` captures `console.error` and asserts on it. Both cases
+  make chassis report a failed reload, and a suite that prints expected stack traces
+  buries the unexpected ones. The report is behaviour worth asserting anyway.
+- The typecheck case asserts exit codes, not the printed `SKIP`: `spinnerFactory`
+  stubs itself out when stdout is not a TTY, so nothing is printed under vitest.
 
 ## Verification
 
 ```
-integration:sidecar        13 passed   (3/3 runs)
+integration:sidecar        17 passed   (3/3 runs, no stderr)
 integration:cli + backend  503 passed | 46 skipped
 unit                       819 passed | 1 skipped
 ```
@@ -91,8 +103,9 @@ Guard-checked, each reverted and confirmed red:
 - raw `watcher.on("change")` instead of `hotUpdate` -> `serve.test.ts` fails, `start:1`
 - close-then-load instead of load-then-close -> both compile-failure tests fail
 - the `close = async () => {}` reset dropped -> the start-failure recovery test fails
+- chassis not reporting a failed reload -> both `console.error` assertions fail
 - `run` input dropped from the sidecar build -> 3 of 5 `build.test.ts` tests fail
 
 One thing the suite does not cover: the `this.environment.name === "sidecar"` check
-in the hook. Removing it keeps all 13 green, because nothing but that environment
+in the hook. Removing it keeps all 17 green, because nothing but that environment
 resolves a module on this server today. Kept as a guard, not because anything trips it.

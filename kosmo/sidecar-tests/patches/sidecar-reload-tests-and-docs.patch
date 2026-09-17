@@ -373,10 +373,10 @@ index e2492a5a..c8b963ab 100644
          provide: {
 diff --git a/test/integration/sidecar/index.ts b/test/integration/sidecar/index.ts
 new file mode 100644
-index 00000000..1d5e0f43
+index 00000000..9198c479
 --- /dev/null
 +++ b/test/integration/sidecar/index.ts
-@@ -0,0 +1,326 @@
+@@ -0,0 +1,403 @@
 +import child_process from "node:child_process";
 +import { mkdir, mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
 +import { tmpdir } from "node:os";
@@ -390,7 +390,7 @@ index 00000000..1d5e0f43
 +import { pathResolver } from "@kosmojs/lib";
 +import { createProject } from "create-kosmo";
 +
-+import { env, exec } from "..";
++import { env, exec, execFile } from "..";
 +import { findFreePort } from "../setup";
 +
 +const pnpmDir = resolve(tmpdir(), ".kosmojs/pnpm-store");
@@ -399,6 +399,7 @@ index 00000000..1d5e0f43
 +  entry?: string;
 +  run?: string;
 +  serve?: boolean;
++  typecheck?: boolean;
 +};
 +
 +/**
@@ -497,7 +498,7 @@ index 00000000..1d5e0f43
 +    },
 +
 +    /** Rewrite the folder's kosmo.config.ts - `run: undefined` drops the key. */
-+    async writeConfig({ entry = "./entry.ts", run, serve }: SidecarConfig) {
++    async writeConfig({ entry = "./entry.ts", run, serve, typecheck }: SidecarConfig) {
 +      await writeFile_(
 +        createPath.src("kosmo.config.ts"),
 +        [
@@ -509,6 +510,9 @@ index 00000000..1d5e0f43
 +          ...(run === undefined ? [] : [`    run: ${JSON.stringify(run)},`]),
 +          ...(serve === undefined ? [] : [`    serve: ${serve},`]),
 +          `  },`,
++          ...(typecheck === undefined
++            ? []
++            : [`  typecheck: ${typecheck},`]),
 +          `});`,
 +          ``,
 +        ].join("\n"),
@@ -603,6 +607,52 @@ index 00000000..1d5e0f43
 +      ].join("\n");
 +    },
 +
++    /**
++     * The same service as plain ESM - no `defineService`, no types, relative
++     * imports carrying their extension. What a sidecar wrapping third-party
++     * JavaScript looks like, and what `typecheck: false` is for.
++     * */
++    mjsEntry() {
++      return [
++        `import { appendFileSync } from "node:fs";`,
++        ``,
++        `import { tick } from "./tick.mjs";`,
++        ``,
++        `const log = (event) => {`,
++        `  appendFileSync(${JSON.stringify(logFile)}, \`\${event}:\${tick}\\n\`);`,
++        `};`,
++        ``,
++        `export default {`,
++        `  async start() {`,
++        `    const timer = setInterval(() => {}, 1000);`,
++        `    log("start");`,
++        `    return async () => {`,
++        `      clearInterval(timer);`,
++        `      log("close");`,
++        `    };`,
++        `  },`,
++        `};`,
++        ``,
++      ].join("\n");
++    },
++
++    mjsRunner() {
++      return [
++        `import service from "./entry.mjs";`,
++        ``,
++        `const close = await service.start();`,
++        ``,
++        `for (const signal of ["SIGINT", "SIGTERM"]) {`,
++        `  process.on(signal, async () => {`,
++        `    await service.teardown?.();`,
++        `    await close();`,
++        `    process.exit(0);`,
++        `  });`,
++        `}`,
++        ``,
++      ].join("\n");
++    },
++
 +    tickModule(value: string) {
 +      return `export const tick = ${JSON.stringify(value)};\n`;
 +    },
@@ -631,6 +681,33 @@ index 00000000..1d5e0f43
 +
 +    build() {
 +      return exec("pnpm", ["build"], { cwd: projectRoot, env });
++    },
++
++    /**
++     * The CLI itself, run against the project - the shared `exec` exits the
++     * whole process on a non-zero code, and a skipped typecheck is something
++     * a test wants to read rather than die on.
++     * */
++    async runKosmo(args: Array<string>) {
++      const bin = resolve(import.meta.dirname, "../../../packages/cli/pkg/cli.js");
++      try {
++        const { stdout, stderr } = await execFile(process.execPath, [bin, ...args], {
++          cwd: projectRoot,
++          env,
++        });
++        return { code: 0, stdout, stderr };
++      } catch (error) {
++        const { code, stdout, stderr } = error as {
++          code?: unknown;
++          stdout?: unknown;
++          stderr?: unknown;
++        };
++        return {
++          code: typeof code === "number" ? code : 1,
++          stdout: String(stdout || ""),
++          stderr: String(stderr || ""),
++        };
++      }
 +    },
 +
 +    distEntries(...path: Array<string>) {
@@ -861,11 +938,11 @@ index 00000000..bc4d9e37
 +});
 diff --git a/test/integration/sidecar/reload-failure.test.ts b/test/integration/sidecar/reload-failure.test.ts
 new file mode 100644
-index 00000000..365d5b5c
+index 00000000..5c4589cd
 --- /dev/null
 +++ b/test/integration/sidecar/reload-failure.test.ts
-@@ -0,0 +1,80 @@
-+import { afterAll, beforeAll, describe, expect, test } from "vitest";
+@@ -0,0 +1,106 @@
++import { afterAll, beforeAll, describe, expect, test, vi } from "vitest";
 +
 +import { setupSidecarProject } from ".";
 +
@@ -882,7 +959,20 @@ index 00000000..365d5b5c
 +  sidecar: { entry: "./entry.ts", run: "./run.ts", serve: true },
 +});
 +
++/**
++ * Both cases below make chassis report a failed reload on `console.error`.
++ * Captured rather than left to print: the report is behaviour worth asserting,
++ * and a suite that logs expected stack traces buries the unexpected ones.
++ * */
++const reported: Array<string> = [];
++
++const takeReported = () => reported.splice(0).join("\n");
++
 +beforeAll(async () => {
++  vi.spyOn(console, "error").mockImplementation((...args: Array<unknown>) => {
++    reported.push(args.map((arg) => String(arg)).join(" "));
++  });
++
 +  await project.bootstrap();
 +  await project.writeSource("tick.ts", project.tickModule("1"));
 +  await project.writeSource(
@@ -895,17 +985,24 @@ index 00000000..365d5b5c
 +
 +afterAll(async () => {
 +  await project.teardown();
++  vi.restoreAllMocks();
 +});
 +
 +const settle = () => new Promise((resolve) => setTimeout(resolve, 2000));
 +
 +describe("a save that cannot compile", () => {
-+  test("leaves the running service untouched", async () => {
++  test("leaves the running service untouched, and says so", async () => {
++    takeReported();
++
 +    await project.writeSource("tick.ts", "export const tick = ;\n");
 +    await settle();
 +
 +    // the import is what throws, and it runs before anything is torn down
 +    expect(await project.readLog()).toEqual(["start:1"]);
++
++    const errors = takeReported();
++    expect(errors).toMatch(/worker: sidecar reload failed/);
++    expect(errors).toMatch(/tick\.ts/);
 +  });
 +
 +  test("the next good save reloads it", async () => {
@@ -913,6 +1010,7 @@ index 00000000..365d5b5c
 +    await settle();
 +
 +    expect(await project.readLog()).toEqual(["start:1", "close:1", "start:2"]);
++    expect(takeReported()).toEqual("");
 +  });
 +});
 +
@@ -928,6 +1026,10 @@ index 00000000..365d5b5c
 +      "start:2",
 +      "close:2",
 +    ]);
++
++    const errors = takeReported();
++    expect(errors).toMatch(/worker: sidecar reload failed/);
++    expect(errors).toMatch(/start failed/);
 +  });
 +
 +  test("the next good save still reloads it", async () => {
@@ -943,5 +1045,98 @@ index 00000000..365d5b5c
 +      "close:2",
 +      "start:3",
 +    ]);
++    expect(takeReported()).toEqual("");
++  });
++});
+diff --git a/test/integration/sidecar/mjs-entry.test.ts b/test/integration/sidecar/mjs-entry.test.ts
+new file mode 100644
+index 00000000..e023449f
+--- /dev/null
++++ b/test/integration/sidecar/mjs-entry.test.ts
+@@ -0,0 +1,86 @@
++import { afterAll, beforeAll, describe, expect, test } from "vitest";
++
++import { setupSidecarProject } from ".";
++
++/**
++ * A sidecar written in plain JavaScript - the `typecheck: false` case
++ * docs/sidecar/development.md points at, for an entry wrapping third-party JS.
++ * Nothing about it is TypeScript: no `defineService`, no types, and relative
++ * imports carry their extension.
++ * */
++const project = await setupSidecarProject({
++  name: "worker",
++  sidecar: {
++    entry: "./entry.mjs",
++    run: "./run.mjs",
++    serve: true,
++    typecheck: false,
++  },
++});
++
++beforeAll(async () => {
++  await project.bootstrap();
++  await project.writeSource("tick.mjs", project.tickModule("1"));
++  await project.writeSource("entry.mjs", project.mjsEntry());
++  await project.writeSource("run.mjs", project.mjsRunner());
++  await project.startDevServer();
++}, 180_000);
++
++afterAll(async () => {
++  await project.teardown();
++});
++
++describe("a plain-JavaScript sidecar", () => {
++  test("the dev server starts it", async () => {
++    expect(await project.waitForLog(1)).toEqual(["start:1"]);
++  });
++
++  test("and reloads it on a change to what it imports", async () => {
++    await project.writeSource("tick.mjs", project.tickModule("2"));
++
++    const log = await project.waitForLog(3);
++
++    // no teardown line: an entry may omit it, and a plain object is a service
++    expect(log).toEqual(["start:1", "close:1", "start:2"]);
++  });
++
++  test("typecheck skips the folder rather than checking it", async () => {
++    // something tsc would certainly reject, so a pass proves the skip rather
++    // than an empty program. Asserting on exit codes, not on the printed
++    // SKIP - the spinner stubs itself out when stdout is not a TTY
++    await project.writeSource(
++      "broken.ts",
++      `export const n: number = "not a number";\n`,
++    );
++
++    const skipped = await project.runKosmo(["typecheck", "worker"]);
++    expect(skipped.code).toEqual(0);
++
++    // `typecheck: false` is the companion to a JavaScript entry; without it
++    // the same folder fails, which is what makes the pass above meaningful
++    await project.writeConfig({
++      entry: "./entry.mjs",
++      run: "./run.mjs",
++      serve: true,
++    });
++
++    const checked = await project.runKosmo(["typecheck", "worker"]);
++    expect(checked.code).not.toEqual(0);
++
++    await project.writeConfig({
++      entry: "./entry.mjs",
++      run: "./run.mjs",
++      serve: true,
++      typecheck: false,
++    });
++  }, 60_000);
++
++  test("builds to the same place a TypeScript one does", async () => {
++    await project.build();
++
++    const entries = await project.distEntries("sidecar");
++
++    expect(entries).toContain("entry.js");
++    expect(entries).toContain("run.js");
 +  });
 +});
