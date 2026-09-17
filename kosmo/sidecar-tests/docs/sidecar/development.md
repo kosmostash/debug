@@ -15,8 +15,8 @@ Whether it does is the `serve` key.
 Without `serve`, a sidecar is built and left alone - it is a build artifact like any other, and starting it is yours.
 With `serve: true`, `kosmo serve` imports the entry into its own Vite environment and calls `start()`.
 
-On a change to anything the entry imports it calls `teardown()`,
-then the close function `start()` returned, re-imports the module and calls `start()` again.
+On a change to anything the entry imports it re-imports the module, calls `teardown()`,
+then the close function `start()` returned, and calls `start()` again on what it loaded.
 
 It is one process, so there is no signal to catch and nothing to wait for on exit -
 but that also means the close function is the only thing that frees a port.
@@ -24,7 +24,8 @@ but that also means the close function is the only thing that frees a port.
 Return one that actually closes the server,
 or the next reload hits `EADDRINUSE` and keeps hitting it until you restart the dev server.
 
-A reload that throws is reported and the dev server stays up; the next good save retries.
+A reload that throws leaves the running service untouched - the new source is loaded before
+anything is torn down - and is reported; the next good save retries.
 
 ::: warning Development only
 `kosmo preview` and `dist/run.js` build sidecars but never start them.

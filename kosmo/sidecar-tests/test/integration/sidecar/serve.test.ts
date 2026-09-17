@@ -34,28 +34,12 @@ describe("sidecar under kosmo serve", () => {
     expect(log.slice(0, 3)).toEqual(["start:1", "teardown:1", "close:1"]);
   });
 
-  /**
-   * Parked, not passing: on one save the restarted service logs `start:1` -
-   * the source as it was before the change. The watcher handler re-imports
-   * the entry before Vite has marked the changed modules dirty, so the module
-   * runner replays its cached transform.
-   *
-   * Deterministic (5/5), on a single write - not a burst.
-   *
-   * What clears it is a timer tick, not elapsed work: measured on this path,
-   * a 0.08ms gap between the change and the re-import is stale and a 1.14ms
-   * one is fresh, with every longer delay fresh too. But `setImmediate`
-   * (3/3) and a real `server.close()` on a live socket (5/5) are both still
-   * stale, so it is the kind of yield that matters, not the duration alone.
-   *
-   * The backend path is unaffected: its generator pass puts 21-34ms of real
-   * fs work between the two, well clear of the line.
-   *
-   * Unskip if the reload ever orders itself after Vite's invalidation.
-   * */
-  test.skip("the restarted service runs the edited source", async () => {
+  test("the restarted service runs the edited source", async () => {
     const log = await project.waitForLog(4);
 
+    // the reload is driven by the `hotUpdate` hook, which Vite calls after it
+    // has invalidated the graph - a raw watcher listener re-imports first and
+    // brings the service back up on the source as it was before the save
     expect(log[3]).toEqual("start:2");
   });
 

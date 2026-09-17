@@ -1,5 +1,5 @@
 diff --git a/docs/sidecar/development.md b/docs/sidecar/development.md
-index 0b45b47a..6987d696 100644
+index 0b45b47a..465bd506 100644
 --- a/docs/sidecar/development.md
 +++ b/docs/sidecar/development.md
 @@ -1,11 +1,12 @@
@@ -18,7 +18,28 @@ index 0b45b47a..6987d696 100644
  ---
  
  In dev mode, `kosmo serve` can run a sidecar alongside your app, so a worker is up while you work on the routes that feed it.
-@@ -32,6 +33,35 @@ A reload that throws is reported and the dev server stays up; the next good save
+@@ -14,8 +15,8 @@ Whether it does is the `serve` key.
+ Without `serve`, a sidecar is built and left alone - it is a build artifact like any other, and starting it is yours.
+ With `serve: true`, `kosmo serve` imports the entry into its own Vite environment and calls `start()`.
+ 
+-On a change to anything the entry imports it calls `teardown()`,
+-then the close function `start()` returned, re-imports the module and calls `start()` again.
++On a change to anything the entry imports it re-imports the module, calls `teardown()`,
++then the close function `start()` returned, and calls `start()` again on what it loaded.
+ 
+ It is one process, so there is no signal to catch and nothing to wait for on exit -
+ but that also means the close function is the only thing that frees a port.
+@@ -23,7 +24,8 @@ but that also means the close function is the only thing that frees a port.
+ Return one that actually closes the server,
+ or the next reload hits `EADDRINUSE` and keeps hitting it until you restart the dev server.
+ 
+-A reload that throws is reported and the dev server stays up; the next good save retries.
++A reload that throws leaves the running service untouched - the new source is loaded before
++anything is torn down - and is reported; the next good save retries.
+ 
+ ::: warning Development only
+ `kosmo preview` and `dist/run.js` build sidecars but never start them.
+@@ -32,6 +34,35 @@ A reload that throws is reported and the dev server stays up; the next good save
  
  ---
  
@@ -66,6 +87,125 @@ index f4670548..b50ef8ad 100644
      "test:integration:backend": "vitest run --project=integration:backend",
      "test:integration:csr": "vitest run --project=integration:csr",
      "test:integration:ssr": "vitest run --project=integration:ssr",
+diff --git a/packages/dev/src/chassis.ts b/packages/dev/src/chassis.ts
+index 317a5c24..4a49dea9 100644
+--- a/packages/dev/src/chassis.ts
++++ b/packages/dev/src/chassis.ts
+@@ -4,7 +4,12 @@ import { join, posix, resolve } from "node:path";
+ import { styleText } from "node:util";
+ 
+ import { pathToRegexp } from "path-to-regexp";
+-import { build, createServer, type RunnableDevEnvironment } from "vite";
++import {
++  build,
++  createServer,
++  type Plugin,
++  type RunnableDevEnvironment,
++} from "vite";
+ 
+ import {
+   defaults,
+@@ -242,6 +247,37 @@ export default async (
+     }
+ 
+     if (sidecar?.serve) {
++      /**
++       * Assigned once the service is up; the reload plugin below is installed
++       * during `createServer`, so the hook has to reach it through a binding
++       * rather than a closure over something that does not exist yet.
++       * */
++      let reload = async () => {};
++
++      /**
++       * Restarting on a raw `watcher.on("change")` reads the module graph
++       * before Vite has invalidated it, and the service comes back up running
++       * the source as it was before the save.
++       *
++       * `hotUpdate` is called after that invalidation, so ordering is a
++       * property of where the hook sits rather than of how long anything
++       * happens to take. Returning `[]` says the update is handled and
++       * leaves Vite nothing to propagate.
++       *
++       * The hook runs once per environment; nothing but `sidecar` resolves a
++       * module on this server today, so the name check is there to keep it
++       * that way rather than because anything currently trips it.
++       * */
++      const reloadPlugin: Plugin = {
++        name: "kosmo:sidecar-reload",
++        hotUpdate({ modules }) {
++          if (this.environment.name === "sidecar" && modules.length) {
++            void reload();
++          }
++          return [];
++        },
++      };
++
+       const viteServer = await createServer(
+         mergeConfigs(
+           // user-provided config - lowest priority
+@@ -251,8 +287,13 @@ export default async (
+             root: createPath.src(),
+             appType: "custom",
+             cacheDir: cacheDir(sourceFolder, command, "sidecar"),
+-            plugins,
+-            server: { hmr: false },
++            plugins: [...plugins, reloadPlugin],
++            /**
++             * `hotUpdate` is part of the HMR pipeline, so it runs only with
++             * `hmr` on - but this server is never listened on, so no socket
++             * is ever bound and no port is taken.
++             * */
++            server: { hmr: true },
+             resolve: {
+               conditions: ["node"],
+             },
+@@ -279,23 +320,30 @@ export default async (
+       let service = await loadService();
+       let close = await service.start();
+ 
+-      viteServer.watcher.on("change", async (file) => {
+-        const mods = env.moduleGraph.getModulesByFile(file);
+-        if (mods?.size) {
+-          try {
+-            await service.teardown?.();
+-            await close();
+-            service = await loadService();
+-            close = await service.start();
+-          } catch (error) {
+-            // keep the dev server alive; the next good save reloads
+-            console.error(
+-              styleText("red", `${sourceFolder.name}: sidecar reload failed`),
+-            );
+-            console.error(error);
+-          }
++      reload = async () => {
++        try {
++          /**
++           * Load before tearing anything down: a save that cannot compile
++           * throws here, and the running service is left untouched rather
++           * than closed with nothing to replace it - which is unrecoverable
++           * for a service whose close function cannot run twice.
++           *
++           * Starting still happens after closing, so a service holding a
++           * port frees it before the new one binds.
++           * */
++          const next = await loadService();
++          await service.teardown?.();
++          await close();
++          service = next;
++          close = await service.start();
++        } catch (error) {
++          // keep the dev server alive; the next good save reloads
++          console.error(
++            styleText("red", `${sourceFolder.name}: sidecar reload failed`),
++          );
++          console.error(error);
+         }
+-      });
++      };
+ 
+       teardownHandlers.push(viteServer.close);
+     }
 diff --git a/test/integration/cli/folders.test.ts b/test/integration/cli/folders.test.ts
 index cbbca4ef..4cd53c69 100644
 --- a/test/integration/cli/folders.test.ts
@@ -226,10 +366,10 @@ index e2492a5a..c8b963ab 100644
          provide: {
 diff --git a/test/integration/sidecar/index.ts b/test/integration/sidecar/index.ts
 new file mode 100644
-index 00000000..b711e4b9
+index 00000000..af577777
 --- /dev/null
 +++ b/test/integration/sidecar/index.ts
-@@ -0,0 +1,278 @@
+@@ -0,0 +1,316 @@
 +import child_process from "node:child_process";
 +import { mkdir, mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
 +import { tmpdir } from "node:os";
@@ -402,6 +542,44 @@ index 00000000..b711e4b9
 +        `  },`,
 +        `  async teardown() {`,
 +        `    log("teardown");`,
++        `  },`,
++        `});`,
++        ``,
++      ].join("\n");
++    },
++
++    /**
++     * The same service, but holding a listening socket - `close()` awaits real
++     * I/O and throws if called twice, which is what a reload has to avoid
++     * doing after one that failed. Binds an ephemeral port: nothing in the
++     * test talks to it, only the lifecycle matters.
++     * */
++    servingEntry() {
++      return [
++        `import { appendFileSync } from "node:fs";`,
++        `import { createServer } from "node:http";`,
++        ``,
++        `import { defineService } from "_/sidecar";`,
++        ``,
++        `import { tick } from "./tick";`,
++        ``,
++        `const log = (event: string) => {`,
++        `  appendFileSync(${JSON.stringify(logFile)}, \`\${event}:\${tick}\\n\`);`,
++        `};`,
++        ``,
++        `export default defineService({`,
++        `  async start() {`,
++        `    const server = createServer((_req, res) => res.end(tick));`,
++        `    await new Promise<void>((resolve) => {`,
++        `      server.listen(0, () => resolve());`,
++        `    });`,
++        `    log("start");`,
++        `    return async () => {`,
++        `      await new Promise<void>((resolve, reject) => {`,
++        `        server.close((error) => (error ? reject(error) : resolve()));`,
++        `      });`,
++        `      log("close");`,
++        `    };`,
 +        `  },`,
 +        `});`,
 +        ``,
@@ -606,10 +784,10 @@ index 00000000..f5f0362c
 +});
 diff --git a/test/integration/sidecar/serve.test.ts b/test/integration/sidecar/serve.test.ts
 new file mode 100644
-index 00000000..53151aec
+index 00000000..bc4d9e37
 --- /dev/null
 +++ b/test/integration/sidecar/serve.test.ts
-@@ -0,0 +1,70 @@
+@@ -0,0 +1,54 @@
 +import { afterAll, beforeAll, describe, expect, test } from "vitest";
 +
 +import { setupSidecarProject } from ".";
@@ -646,28 +824,12 @@ index 00000000..53151aec
 +    expect(log.slice(0, 3)).toEqual(["start:1", "teardown:1", "close:1"]);
 +  });
 +
-+  /**
-+   * Parked, not passing: on one save the restarted service logs `start:1` -
-+   * the source as it was before the change. The watcher handler re-imports
-+   * the entry before Vite has marked the changed modules dirty, so the module
-+   * runner replays its cached transform.
-+   *
-+   * Deterministic (5/5), on a single write - not a burst.
-+   *
-+   * What clears it is a timer tick, not elapsed work: measured on this path,
-+   * a 0.08ms gap between the change and the re-import is stale and a 1.14ms
-+   * one is fresh, with every longer delay fresh too. But `setImmediate`
-+   * (3/3) and a real `server.close()` on a live socket (5/5) are both still
-+   * stale, so it is the kind of yield that matters, not the duration alone.
-+   *
-+   * The backend path is unaffected: its generator pass puts 21-34ms of real
-+   * fs work between the two, well clear of the line.
-+   *
-+   * Unskip if the reload ever orders itself after Vite's invalidation.
-+   * */
-+  test.skip("the restarted service runs the edited source", async () => {
++  test("the restarted service runs the edited source", async () => {
 +    const log = await project.waitForLog(4);
 +
++    // the reload is driven by the `hotUpdate` hook, which Vite calls after it
++    // has invalidated the graph - a raw watcher listener re-imports first and
++    // brings the service back up on the source as it was before the save
 +    expect(log[3]).toEqual("start:2");
 +  });
 +
@@ -678,5 +840,54 @@ index 00000000..53151aec
 +    await new Promise((resolve) => setTimeout(resolve, 1000));
 +
 +    expect(await project.readLog()).toEqual(before);
++  });
++});
+diff --git a/test/integration/sidecar/reload-failure.test.ts b/test/integration/sidecar/reload-failure.test.ts
+new file mode 100644
+index 00000000..ace887c0
+--- /dev/null
++++ b/test/integration/sidecar/reload-failure.test.ts
+@@ -0,0 +1,43 @@
++import { afterAll, beforeAll, describe, expect, test } from "vitest";
++
++import { setupSidecarProject } from ".";
++
++/**
++ * A service holding a socket, so its close function does real work and cannot
++ * run twice - the shape that turns a mishandled failed reload into a sidecar
++ * that never comes back.
++ * */
++const project = await setupSidecarProject({
++  name: "worker",
++  sidecar: { entry: "./entry.ts", run: "./run.ts", serve: true },
++});
++
++beforeAll(async () => {
++  await project.bootstrap();
++  await project.writeSource("tick.ts", project.tickModule("1"));
++  await project.writeSource("entry.ts", project.servingEntry());
++  await project.startDevServer();
++  await project.waitForLog(1);
++}, 180_000);
++
++afterAll(async () => {
++  await project.teardown();
++});
++
++describe("a reload that throws", () => {
++  test("leaves the running service untouched", async () => {
++    await project.writeSource("tick.ts", "export const tick = ;\n");
++    await new Promise((resolve) => setTimeout(resolve, 1500));
++
++    // nothing was torn down: closing before knowing the new source compiles
++    // would leave the service shut with nothing to replace it
++    expect(await project.readLog()).toEqual(["start:1"]);
++  });
++
++  test("the next good save reloads it", async () => {
++    await project.writeSource("tick.ts", project.tickModule("2"));
++    await new Promise((resolve) => setTimeout(resolve, 2000));
++
++    expect(await project.readLog()).toEqual(["start:1", "close:1", "start:2"]);
 +  });
 +});

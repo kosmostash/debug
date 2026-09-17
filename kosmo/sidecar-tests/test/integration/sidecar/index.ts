@@ -176,6 +176,44 @@ export const setupSidecarProject = async ({
       ].join("\n");
     },
 
+    /**
+     * The same service, but holding a listening socket - `close()` awaits real
+     * I/O and throws if called twice, which is what a reload has to avoid
+     * doing after one that failed. Binds an ephemeral port: nothing in the
+     * test talks to it, only the lifecycle matters.
+     * */
+    servingEntry() {
+      return [
+        `import { appendFileSync } from "node:fs";`,
+        `import { createServer } from "node:http";`,
+        ``,
+        `import { defineService } from "_/sidecar";`,
+        ``,
+        `import { tick } from "./tick";`,
+        ``,
+        `const log = (event: string) => {`,
+        `  appendFileSync(${JSON.stringify(logFile)}, \`\${event}:\${tick}\\n\`);`,
+        `};`,
+        ``,
+        `export default defineService({`,
+        `  async start() {`,
+        `    const server = createServer((_req, res) => res.end(tick));`,
+        `    await new Promise<void>((resolve) => {`,
+        `      server.listen(0, () => resolve());`,
+        `    });`,
+        `    log("start");`,
+        `    return async () => {`,
+        `      await new Promise<void>((resolve, reject) => {`,
+        `        server.close((error) => (error ? reject(error) : resolve()));`,
+        `      });`,
+        `      log("close");`,
+        `    };`,
+        `  },`,
+        `});`,
+        ``,
+      ].join("\n");
+    },
+
     tickModule(value: string) {
       return `export const tick = ${JSON.stringify(value)};\n`;
     },
